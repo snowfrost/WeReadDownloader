@@ -243,6 +243,30 @@ WeReadWorker.exe (CLI 引擎)
 
 ## 四、变更日志（Keep a Changelog 格式）
 
+### 2026-11-02 (3) 发布 v1.0.8 到 GitHub（**Added**，发布流程）
+
+- **代码推到 `snowfrost/WeReadDownloader` master**，新增提交 `21830f8`，父提交是远端
+  原本的 `cda67e5`——历史接续，没有强推、没有覆盖。
+- **打 tag `v1.0.8` 并发 Release**：
+  <https://github.com/snowfrost/WeReadDownloader/releases/tag/v1.0.8>
+  资产 `WeReadDesktop-1.0.8-webview-win64.zip`（20,095,824 字节，源码目录 42MB）。
+- **安装包**：zip 内含 `WeReadDesktop.exe` + `_internal` + `安装说明.txt`；解压实测可运行
+  （`page ready keys=28`，570ms）。
+- **README 截图换成 WebView 版**：`docs/screenshots/01-workflow.png` 与
+  `02-shelf.png` 用示例数据在真实界面里重截，避免把书架里的真实书名公开。
+  README 里「Tk 图形界面」的表述也一并改掉。
+- **发布路径（重要，写进流程）**：这台机器 `github.com:443` 不可达（`curl` 返回 000），
+  `git push` 与 `git fetch` 都失败（代理会在传输 pack 时切断）；但
+  `api.github.com`、`uploads.github.com` 可通。因此发布改用 GitHub Git Data API：
+  逐个文件建 blob → 以远端 tree 为 base 建 tree → 建 commit（父提交为远端 head）→
+  更新 ref → 打 tag → 建 Release → 上传资产。脚本：`tools/publish_release.py`
+  （支持 `--dry-run` 与 `--no-release`）。
+- **CI 修复（`Fixed`）**：首次推送后 privacy gate 失败，原因与代码无关——
+  `ubuntu-latest` 已升级到 Ubuntu 26.04，`setup-python` 在该镜像上没有 Python 3.9。
+  把该作业改用 3.12（Windows 测试作业仍保留 3.9 覆盖旧版本），提交 `7142471`。
+  复跑两个作业均 **success**。
+- 版本说明：tag `v1.0.8` 指向 `21830f8`，master 比 tag 多一个「只改 CI」的提交。
+
 ### 2026-11-02 (2) 书架标注「已下载 / 未完成」（**Added**）
 
 - **后端 `_export_index()`**：扫一次 `OUTPUT`，把目录名 `<书名>-<bookId>`
