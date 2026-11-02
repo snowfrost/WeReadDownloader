@@ -77,6 +77,8 @@ def main() -> int:
     parser.add_argument("--asset", required=True)
     parser.add_argument("--message-file", default="release-commit-message.txt")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-release", action="store_true",
+                        help="only update the branch, skip tag and release")
     args = parser.parse_args()
 
     if not TOKEN:
@@ -139,6 +141,10 @@ def main() -> int:
     call("PATCH", "%s/repos/%s/git/refs/heads/%s" % (API, repo, args.branch),
          {"sha": commit["sha"], "force": False})
     print("branch %s updated" % args.branch)
+
+    if args.no_release:
+        print("branch only: skipping tag and release")
+        return 0
 
     try:
         call("POST", "%s/repos/%s/git/refs" % (API, repo),
