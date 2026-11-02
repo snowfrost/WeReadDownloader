@@ -129,19 +129,24 @@ def test_every_nav_row_is_a_single_clickable_button():
 
 @test
 def test_the_selected_row_shows_the_active_look():
-    """Selection must be visible: filled, bright, bold, with the accent bar."""
+    """Selection must be visible: raised surface, bright, bold, no loud outline.
+
+    2026-10-29: the 3px gold border was replaced. On the dark Nocturne ground a
+    full outline around the row read as a keyboard focus ring; the raised
+    surface (SIDE_ACTIVE) plus bright bold text is the selection.
+    """
     root, inst = _make_instance()
     try:
         inst._switch_page("存储占用")
         root.update()
         active_item = inst.nav_items["存储占用"]
         assert active_item._nav_active is True
-        assert active_item.cget("border_width") == 3, active_item.cget("border_width")
+        assert active_item.cget("fg_color") == inst.SIDE_ACTIVE
         assert active_item.cget("text_color") == inst.SIDE_TXT_HI
         # and the row it left behind must be demoted
         workshop = inst.nav_items["下载工坊"]
         assert workshop._nav_active is False
-        assert workshop.cget("border_width") == 0
+        assert workshop.cget("fg_color") == "transparent"
         assert workshop.cget("text_color") == inst.SIDE_TXT
     finally:
         root.destroy()

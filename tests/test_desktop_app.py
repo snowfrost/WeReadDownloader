@@ -231,8 +231,10 @@ def test_gui_search_click_detail_flow_survives_worker_failure():
         assert instance.book_rows["19480992"]["author"] == "齐佩甲"
         assert "找到 2 本书" in instance.result_count.cget("text")
         card = instance.card_widgets["19480992"]
-        assert card["category"].cget("text") == "分类：男生小说-游戏竞技"
-        assert instance.card_widgets["3004323461"]["category"].cget("text") == "分类：暂无信息"
+        # 2026-10-28 起结果行只画封面/书名/作者，分类不再上卡片；
+        # 分类数据照常进 book_rows，详情区可查。这里断言数据层。
+        assert instance.book_rows["19480992"]["category"] == "男生小说-游戏竞技"
+        assert instance.book_rows["3004323461"]["category"] == "暂无信息"
         assert "找到 2 本书" in instance.status.get()
 
         # covers resolve from the fake HTTP layer

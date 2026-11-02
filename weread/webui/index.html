@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeReadDownloader</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="aurora a1"></div>
+<div class="aurora a2"></div>
+<div class="aurora a3"></div>
+
+<div id="app">
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-mark">读</div>
+      <div class="brand-text">
+        <strong>WeRead</strong>
+        <span>Downloader</span>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-page="workshop"><span>◇</span>下载工坊</button>
+      <button class="nav-item" data-page="shelf"><span>▤</span>我的书架</button>
+      <button class="nav-item" data-page="history"><span>↺</span>下载记录</button>
+      <button class="nav-item" data-page="storage"><span>▥</span>存储占用</button>
+    </nav>
+    <div class="rail-spacer"></div>
+    <nav class="nav">
+      <button class="nav-item" data-page="settings"><span>⚙</span>设置</button>
+    </nav>
+    <div class="rail-foot" id="rail-version">v—</div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="search-box">
+        <span class="search-glyph">⌕</span>
+        <input id="search-input" type="text" autocomplete="off" spellcheck="false"
+               placeholder="搜索书名、作者或关键词…">
+        <kbd>Enter</kbd>
+      </div>
+      <button class="btn primary" id="search-btn">搜索</button>
+      <div class="top-actions">
+        <button class="btn ghost" id="queue-btn">队列 <b id="queue-count">0</b> 本</button>
+        <button class="chip" id="auth-chip" title="点击重新检查登录状态">尚未检查</button>
+        <button class="btn ghost" id="login-btn">登录 / 切换账号</button>
+      </div>
+    </header>
+
+    <section class="content" id="content">
+      <!-- 下载工坊 -->
+      <section class="page active" data-page="workshop">
+        <div class="page-head">
+          <h1>下载工坊</h1>
+          <p id="search-meta">搜索结果会显示在这里</p>
+        </div>
+        <div class="work-grid">
+          <section class="panel results-panel">
+            <div class="panel-head">
+              <div><span class="num">①</span><h2>搜索结果</h2></div>
+              <span class="hint" id="result-count">0 本</span>
+            </div>
+            <div class="result-actions" id="result-actions">
+              <span class="hint">勾选多本可加入队列</span>
+              <button class="btn tiny" id="enqueue-btn" disabled>加入队列 0 本</button>
+            </div>
+            <div class="result-list" id="result-list">
+              <div class="empty-state" id="results-empty">
+                <div class="empty-glyph">⌕</div>
+                <p>在上面搜索一本书，结果会出现在这里。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel detail-panel">
+            <div class="panel-head">
+              <div><span class="num">②</span><h2>确认书籍</h2></div>
+            </div>
+            <div class="detail" id="detail">
+              <div class="empty-state" id="detail-empty">
+                <div class="empty-glyph">▤</div>
+                <p>点击左侧一本书，查看封面、作者和简介。</p>
+              </div>
+              <div class="detail-body hidden" id="detail-body">
+                <div class="detail-top">
+                  <div class="cover" id="detail-cover">封面</div>
+                  <div class="detail-meta">
+                    <h3 id="detail-title">—</h3>
+                    <p id="detail-author" class="muted"></p>
+                    <p id="detail-category" class="muted"></p>
+                    <p id="detail-rating" class="rating"></p>
+                    <p id="detail-id" class="mono faint"></p>
+                  </div>
+                </div>
+                <div class="divider"></div>
+                <div class="intro-head">简介</div>
+                <div class="intro" id="detail-intro">—</div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel download-panel">
+          <div class="download-head">
+            <div><span class="num">③</span><h2>下载到电脑</h2></div>
+            <div class="annotation">
+              <label for="annotation">标注方式</label>
+              <select id="annotation"></select>
+              <span class="hint" id="annotation-hint"></span>
+            </div>
+          </div>
+          <div class="download-actions">
+            <button class="btn ghost" id="probe-btn">先检查第一章</button>
+            <button class="btn primary wide" id="download-btn" disabled>开始下载 / 继续下载</button>
+          </div>
+          <div class="progress"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="status-line" id="status-line">准备就绪。</div>
+          <div class="download-foot">
+            <button class="btn danger-soft" id="pause-btn" disabled>暂停下载</button>
+            <div class="grow"></div>
+            <button class="btn ghost" id="logout-btn">退出登录</button>
+            <button class="btn ghost" id="logs-btn">查看技术日志</button>
+            <button class="btn ghost" id="open-output-btn">打开下载目录</button>
+          </div>
+          <div class="log-drawer" id="log-drawer"></div>
+        </section>
+      </section>
+
+      <!-- 我的书架 -->
+      <section class="page" data-page="shelf">
+        <div class="page-head">
+          <h1>我的书架</h1>
+          <p>微信书架用于挑书下载；本机导出用于清理磁盘。</p>
+        </div>
+        <div class="tabs">
+          <button class="tab active" data-tab="wechat">微信书架</button>
+          <button class="tab" data-tab="exports">本机已导出</button>
+          <div class="grow"></div>
+          <button class="btn ghost small" id="shelf-refresh">刷新书架</button>
+        </div>
+        <section class="panel fill" id="shelf-wechat">
+          <div class="panel-head">
+            <div><h2>微信书架</h2><span class="hint" id="shelf-count">共 0 本</span></div>
+            <div class="panel-tools">
+              <button class="btn tiny" id="shelf-select-all">全选</button>
+              <button class="btn tiny" id="shelf-enqueue" disabled>加入队列 0 本</button>
+            </div>
+          </div>
+          <div class="shelf-grid" id="shelf-grid"></div>
+        </section>
+        <section class="panel fill hidden" id="shelf-exports">
+          <div class="panel-head">
+            <div><h2>本机已导出</h2><span class="hint" id="exports-count">共 0 项</span></div>
+            <div class="panel-tools">
+              <button class="btn tiny" id="exports-select-all">全选</button>
+              <button class="btn tiny" id="exports-delete" disabled>删除选中 0 项</button>
+              <button class="btn tiny" id="exports-clean">清半成品保 EPUB</button>
+            </div>
+          </div>
+          <div class="export-list" id="export-list"></div>
+        </section>
+      </section>
+
+      <!-- 下载记录 -->
+      <section class="page" data-page="history">
+        <div class="page-head">
+          <h1>下载记录</h1>
+          <p>每次完成的下载会在这里留一条，按时间倒序。</p>
+        </div>
+        <section class="panel fill">
+          <div class="history-list" id="history-list"></div>
+          <div class="pager" id="history-pager">
+            <button class="btn tiny" id="history-prev">上一页</button>
+            <span class="hint" id="history-page">—</span>
+            <button class="btn tiny" id="history-next">下一页</button>
+          </div>
+        </section>
+      </section>
+
+      <!-- 存储占用 -->
+      <section class="page" data-page="storage">
+        <div class="page-head">
+          <h1>存储占用</h1>
+          <p>导出目录占了多少、能回收多少，以及每本书的去留。</p>
+        </div>
+        <div class="stat-row" id="stat-row"></div>
+        <section class="panel fill">
+          <div class="panel-head">
+            <h2>导出目录</h2>
+            <button class="btn ghost small" id="storage-refresh">重新扫描</button>
+          </div>
+          <div class="export-list" id="storage-list"></div>
+        </section>
+      </section>
+
+      <!-- 设置 -->
+      <section class="page" data-page="settings">
+        <div class="page-head">
+          <h1>设置</h1>
+          <p>路径、登录状态与版本信息。</p>
+        </div>
+        <section class="panel">
+          <div class="panel-head"><h2>账号</h2></div>
+          <div class="setting-row"><span>登录状态</span><b id="settings-auth">尚未检查</b></div>
+          <div class="setting-row"><span>账号操作</span>
+            <div><button class="btn ghost small" id="settings-login">扫码登录</button>
+            <button class="btn ghost small" id="settings-logout">退出登录</button></div>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>路径</h2></div>
+          <div class="setting-row"><span>下载目录</span><code id="path-output">—</code>
+            <button class="btn tiny" data-open="output">打开</button></div>
+          <div class="setting-row"><span>日志目录</span><code id="path-logs">—</code>
+            <button class="btn tiny" data-open="logs">打开</button></div>
+          <div class="setting-row"><span>版本</span><b id="settings-version">—</b></div>
+        </section>
+      </section>
+    </section>
+
+    <footer class="statusbar">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">界面初始化中…</span>
+      <div class="grow"></div>
+      <span class="mono faint" id="status-meta"></span>
+    </footer>
+  </main>
+</div>
+
+<!-- 队列弹层 -->
+<div class="modal-backdrop hidden" id="queue-modal">
+  <div class="modal queue-modal">
+    <div class="modal-head"><h2>下载队列</h2><button class="icon-btn" data-close>×</button></div>
+    <div class="queue-current" id="queue-current"></div>
+    <div class="queue-list" id="queue-list"></div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="queue-clear">清空队列</button>
+      <div class="grow"></div>
+      <button class="btn ghost" data-close>关闭</button>
+      <button class="btn primary" id="queue-start">开始队列下载</button>
+    </div>
+  </div>
+</div>
+
+<!-- 登录弹层 -->
+<div class="modal-backdrop hidden" id="login-modal">
+  <div class="modal login-modal">
+    <div class="modal-head"><h2>扫码登录</h2><button class="icon-btn" data-close>×</button></div>
+    <div class="login-body">
+      <div class="qr-box"><img id="login-qr" alt="登录二维码"><div class="qr-placeholder" id="qr-placeholder">正在获取二维码…</div></div>
+      <p class="muted" id="login-status">请用手机微信读书「扫一扫」。</p>
+      <div class="otp-row hidden" id="otp-row">
+        <input id="otp-input" maxlength="4" inputmode="numeric" placeholder="4 位验证码">
+        <button class="btn primary small" id="otp-submit">提交</button>
+      </div>
+    </div>
+    <div class="modal-foot"><button class="btn ghost" id="login-refresh">重新获取二维码</button><div class="grow"></div><button class="btn ghost" data-close>关闭</button></div>
+  </div>
+</div>
+
+<div class="toast hidden" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

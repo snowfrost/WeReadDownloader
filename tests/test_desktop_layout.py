@@ -242,7 +242,8 @@ def test_the_queue_checkbox_is_not_clipped_by_a_long_title():
     """勾选框要完整落在行内。
 
     这张卡片曾经把勾选框 pack 到右侧剩余空隙，长标题时被卡片边缘裁掉，只剩
-    半个圆圈。现在行画在 canvas 上，直接量勾选框与「加入队列」文字的坐标。
+    半个圆圈。2026-10-28 起行是紧凑双行（封面/书名/作者），勾选框固定在
+    行尾 width-34 处：量它与行右边缘的距离，并确认长标题完整画出。
     """
     root, instance = _make_gui()
     try:
@@ -257,11 +258,13 @@ def test_the_queue_checkbox_is_not_clipped_by_a_long_title():
         entry = instance.results.items["111"]
         x0, y0, x1, y1 = canvas.coords(entry["check"])
         width = max(1, canvas.winfo_width())
-        assert x1 < width * 0.6, (
-            "勾选框贴在行右侧（x1 %d / width %d），会被滚动条盖住" % (x1, width))
+        # 勾选框在行尾、与右边缘留出空隙，不被滚动条压住也不出界。
+        assert width - 40 <= x0 < x1 <= width - 8, (
+            "勾选框应贴行尾且完整（x %d-%d / width %d）" % (x0, x1, width))
         texts = [canvas.itemcget(i, "text") for i in canvas.find_all()
                  if canvas.type(i) == "text"]
-        assert "加入队列" in texts, texts
+        assert any("三字经" in t for t in texts), texts
+        assert any("李逸安" in t for t in texts), texts
     finally:
         root.destroy()
 

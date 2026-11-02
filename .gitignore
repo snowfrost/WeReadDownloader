@@ -36,3 +36,6 @@ credentials.json
 #   *.spec / installer\*.iss / installer\*.isl  - reproducible build + installer definition
 #   assets\ (icons) / design\ (reference captures + NOTES.md)
 #   *.py / *.lua / *.html / *.md                 - source and its tests
+
+# Local WebView build venv
+.venv-webui/

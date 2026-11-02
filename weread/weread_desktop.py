@@ -517,6 +517,34 @@ def validate_chapter_body(xhtml: str, chapter: dict[str, Any]) -> None:
         )
 
 
+#: 缺章说明页。这一页只说明发生了什么，不编任何"正文"——残书之所以危险，
+#: 是因为读者看不出哪一页本该有字；写明比留白诚实，也比静默跳过安全。
+SKIPPED_CHAPTER_NOTE = (
+    '<div style="border:1px solid #C8CCD2;border-radius:6px;padding:14px 16px;'
+    'margin:1em 0;color:#3C4043">'
+    '<p style="margin:0 0 6px;font-weight:bold">本章正文未能获取</p>'
+    '<p style="margin:0;line-height:1.7;font-size:.94em">'
+    '微信读书服务器没有返回这一章的正文（%s）。为避免把残缺内容当成正文，这里不填充'
+    '任何文字。重新下载本书时会再次尝试这一章，其它章节不受影响。</p></div>'
+)
+
+
+def write_skipped_chapter_note(body_path: Path, review_path: Path, css_path: Path,
+                               chapter: dict[str, Any], reason: str) -> None:
+    """Stage an honest note page for a chapter WeRead has no text for.
+
+    The review row carries ``skipped`` so the checkpoint reader re-fetches the
+    chapter on the next run instead of treating this page as downloaded text.
+    """
+    atomic_text(body_path, SKIPPED_CHAPTER_NOTE % epub_escape(reason))
+    atomic_text(css_path, "")
+    atomic_text(review_path, json.dumps({
+        "chapter_uid": str(chapter["chapterUid"]),
+        "reviews": [], "underline_ranges": 0, "embedded_markers": 0,
+        "skipped": reason,
+    }, ensure_ascii=False))
+
+
 def lua_json(lua: LuaRuntime, value: Any) -> bytes:
     lua.globals()._json_value = lua_table(lua, value)
     return lua.eval(b'require("json").encode(_json_value)')
@@ -1667,6 +1695,10 @@ def discover_checkpoint_files(workspace: Path, chapters: list[dict[str, Any]]) -
             css_path = workspace / (stem + ".css")
             if uid not in allowed or uid in found or not (body_path.is_file() and css_path.is_file()):
                 continue
+            # 跳过的章节只有一页说明，不是正文：下次续传要重新去取，
+            # 否则"服务器那次没给"会被当成"已经下载完成"永久固化。
+            if row.get("skipped"):
+                continue
             # Refused highlights are a valid, reported omission, not a broken chapter.
             if not body_path.read_text(encoding="utf-8").strip():
                 continue
@@ -1691,6 +1723,24 @@ CHAPTER_TRANSIENT_ATTEMPTS = 3
 CHAPTER_RETRY_BASE_DELAY = 2.0
 
 
+#: 服务器侧的内容型失败：重试不可能变出正文，但其它章节完全正常。
+#: 这类章节跳过（书照常出版，缺的那章在书里留一页说明，manifest 里记明），
+#: 而不是用一章的问题废掉整本。与限流、校验和不符、超时区分开——那些是
+#: "稍后再试就好"，跳过去会把一次坏网络变成一本残书。
+SKIPPABLE_CHAPTER_MARKERS = (
+    "empty body despite catalog wordCount",
+    "decoded without an XHTML body",
+    "plain-text shards decoded to",
+    "is marked paid",
+)
+
+
+def is_skippable_chapter_fault(exc: BaseException) -> bool:
+    """Is this chapter permanently without text on the server's side?"""
+    text = f"{type(exc).__name__}: {exc}"
+    return any(marker in text for marker in SKIPPABLE_CHAPTER_MARKERS)
+
+
 def is_transient_chapter_fault(exc: BaseException) -> bool:
     """Is this chapter failure worth a bounded retry?
 
@@ -1708,7 +1758,8 @@ def run_chapter_with_retries(uid: str, attempt_once, throttle: "Throttle",
                              unresolved: dict[str, str],
                              sleep=None,
                              transient_attempts: int = CHAPTER_TRANSIENT_ATTEMPTS,
-                             base_delay: float = CHAPTER_RETRY_BASE_DELAY) -> bool:
+                             base_delay: float = CHAPTER_RETRY_BASE_DELAY,
+                             skipped: dict[str, str] | None = None) -> bool:
     """Run one chapter until it succeeds, is rate-limited out, or exhausts retries.
 
     Rate limits keep their own budget (Throttle.max_attempts). A transient
@@ -1716,6 +1767,14 @@ def run_chapter_with_retries(uid: str, attempt_once, throttle: "Throttle",
     with exponential backoff between them. Anything else is permanent. Whatever
     is left over is recorded in `unresolved` so the caller refuses to publish an
     incomplete EPUB; nothing here drops a chapter silently.
+
+    `skipped` changes the last step for content faults only. When the server
+    itself has no text for the chapter (empty body, paid placeholder, undecodable
+    text) the UID is recorded there instead of in `unresolved`, the caller keeps
+    the book and stamps a note page in that chapter's place. Rate limits,
+    checksum mismatches and transport errors never take this path: those are
+    "try again later", and skipping them would turn one bad network window into
+    a book with silent holes.
 
     Returns True when the chapter completed.
     """
@@ -1752,6 +1811,14 @@ def run_chapter_with_retries(uid: str, attempt_once, throttle: "Throttle",
                     (sleep or time.sleep)(delay)
                     continue
                 reason = f"{reason} (gave up after {transient_attempts} attempts)"
+            if skipped is not None and is_skippable_chapter_fault(exc):
+                skipped[uid] = reason
+                print(f"[SKIPPED] chapter UID {uid} has no text on WeRead's side: "
+                      f"{reason}; keeping the rest of the book and leaving a note "
+                      f"page in its place. A later re-download retries this "
+                      f"chapter.", flush=True)
+                print(detail, file=sys.stderr, flush=True)
+                return False
             unresolved[uid] = reason
             kind = "THROTTLED" if throttle.throttled else "UNRESOLVED"
             print(f"[{kind}] chapter UID {uid} marked INCOMPLETE: {reason}; "
@@ -2011,7 +2078,8 @@ def export_book(book_id: str, output: Path, settings: dict[str, Any], jobs: int 
                 want_thoughts: bool = True,
                 want_underlines: bool = True,
                 unified_appendix: bool = False,
-                appendix_scope: str = "both") -> Path:
+                appendix_scope: str = "both",
+                skip_empty_chapters: bool = True) -> Path:
     secure_output_directory(output)
     # 每次导出从零开始计数：同一进程内连跑两本书时，上一本丢弃的注数不能带到
     # 这一本的 manifest 里。
@@ -2248,6 +2316,11 @@ def export_book(book_id: str, output: Path, settings: dict[str, Any], jobs: int 
     print(f"[RESUME] Reusing {cached_count} complete chapter(s) by UID; {len(pending)} remain", flush=True)
     jobs = min(max(1, int(jobs)), 4, max(1, len(pending)))
     unresolved: dict[str, str] = {}
+    # 服务器侧没有正文的章节（空正文、付费占位、无法解码）单独记账：跳过它们，
+    # 书照常出版，缺的那几章在书里留说明页，并在 manifest / 日志里点名。
+    # --strict-chapters 时退回旧行为：缺一章就不出版。
+    skipped: dict[str, str] = {}
+    skip_sink = skipped if skip_empty_chapters else None
 
     # Rate limiting is not a content fault. WeRead answers 426/429/403 when a
     # burst of chapter requests trips a limit, and treating that like a bad
@@ -2261,9 +2334,20 @@ def export_book(book_id: str, output: Path, settings: dict[str, Any], jobs: int 
 
     def fetch_with_retries(index: int, chapter: dict[str, Any]) -> None:
         uid = str(chapter["chapterUid"])
-        run_chapter_with_retries(uid, lambda: download_one(index, chapter,
-                                                          want_underlines),
-                                 throttle, unresolved)
+        done = run_chapter_with_retries(uid, lambda: download_one(index, chapter,
+                                                                  want_underlines),
+                                        throttle, unresolved, skipped=skip_sink)
+        if not done and uid in skipped:
+            # 占位页必须落盘：EPUB 的页序按目录走，缺一个 body 会让整本书
+            # 在装配阶段炸掉——跳过一章不能变成跳过整本。
+            try:
+                write_skipped_chapter_note(chapter_paths[index - 1],
+                                           review_paths[index - 1],
+                                           css_paths[index - 1], chapter,
+                                           skipped[uid])
+            except OSError as exc:
+                unresolved[uid] = f"skipped chapter note could not be staged: {exc}"
+                skipped.pop(uid, None)
 
     try:
         if jobs == 1:
@@ -2283,6 +2367,19 @@ def export_book(book_id: str, output: Path, settings: dict[str, Any], jobs: int 
         if saved_dead:
             print(f"[IMAGE] remembered {saved_dead} dead image URL(s) for the "
                   f"next run", flush=True)
+    skipped_path = workspace / "skipped_chapters.json"
+    if skipped:
+        atomic_text(skipped_path, json.dumps(skipped, ensure_ascii=False, indent=2))
+        by_uid = {str(chapter["chapterUid"]): str(chapter.get("title") or "")
+                  for chapter in chapters}
+        named = "、".join(filter(None, (by_uid.get(uid, "") for uid in sorted(skipped))))
+        print(f"[SKIPPED] {len(skipped)} of {len(chapters)} chapter(s) came back "
+              f"without text and were skipped: {', '.join(sorted(skipped))}"
+              f"{' (' + named + ')' if named else ''}. A note page stands in for "
+              f"each of them; every other chapter is published as usual, and a "
+              f"later re-download retries these.", flush=True)
+    else:
+        skipped_path.unlink(missing_ok=True)
     failed_path = workspace / "failed_chapters.json"
     if unresolved:
         atomic_text(failed_path, json.dumps(unresolved, ensure_ascii=False, indent=2))
@@ -2426,7 +2523,9 @@ def export_book(book_id: str, output: Path, settings: dict[str, Any], jobs: int 
     # the book is whole, and degraded output is only better than failed output
     # if the loss is stated.
     omission_report = {
-        "text_complete": True,
+        # 「正文完整」只有在每一章都拿到正文时才成立。跳过的章节让这句变成
+        # False：书能读、但确实缺页，不能对读者谎称完整。
+        "text_complete": not skipped,
         "thoughts_requested": bool(want_thoughts),
         "annotation_fetch_failures": fetch_failures,
         "chapters_with_annotation_fetch_failures": chapters_with_fetch_failures,
@@ -2490,6 +2589,16 @@ def export_book(book_id: str, output: Path, settings: dict[str, Any], jobs: int 
     omission_report["unplaced_underline_total"] = unplaced_total
     if unplaced_details:
         omission_report["unplaced_underline_details"] = unplaced_details
+    if skipped:
+        titles = {str(chapter["chapterUid"]): str(chapter.get("title") or "")
+                  for chapter in chapters}
+        omission_report["chapters_skipped"] = [
+            {"chapterUid": uid, "title": titles.get(uid, ""), "reason": reason}
+            for uid, reason in sorted(skipped.items())]
+        omission_report["reason_skipped"] = (
+            "微信读书服务器对这些章节只返回了空正文（或付费占位），重试无法变出正文。"
+            "本次导出跳过了它们，在书内对应位置留了一页说明；其余章节完整。"
+            "重新下载本书会再次尝试这几章。")
     dropped_annotations = _dropped_annotations()
     if dropped_annotations:
         omission_report["annotation_fragments_dropped"] = dropped_annotations
@@ -2760,6 +2869,14 @@ def main() -> int:
                         help="Which parts the unified appendix collects: both (default), "
                              "notes only, or thoughts only. Ignored without "
                              "--unified-appendix.")
+    parser.add_argument("--strict-chapters", dest="skip_empty_chapters",
+                        action="store_false",
+                        help="Refuse to publish an EPUB when any chapter has no text "
+                             "on WeRead's side. Default is to skip only those "
+                             "chapters (empty body / paid placeholder / undecodable "
+                             "text), leave a note page in their place, and publish "
+                             "the rest of the book. Rate limits, checksum mismatches "
+                             "and network faults still abort either way.")
     args = parser.parse_args()
     if args.serve:
         return serve_forever()
@@ -2832,7 +2949,8 @@ def main() -> int:
             shelf_books(settings)
             return 0
         result = export_book(args.book_id, args.output, settings, args.jobs, want_thoughts,
-                       want_underlines, unified_appendix, appendix_scope)
+                       want_underlines, unified_appendix, appendix_scope,
+                       skip_empty_chapters=args.skip_empty_chapters)
         print("DONE", result, flush=True)
         return 0
     except Exception as exc:

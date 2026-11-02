@@ -228,6 +228,63 @@ def test_the_local_export_half_still_offers_delete_and_reclaim():
         root.destroy()
 
 
+@test
+def test_shelf_and_exports_are_two_full_height_tabs():
+    """书架不该再被导出列表挤成三行高。
+
+    旧布局把两块上下叠在一页：书架固定 300（最多 560），导出列表再占 300，
+    两边都短。现在各占一个页签、各自 fill+expand，切换只换页签不重建列表。
+    """
+    root, inst = _make_instance()
+    try:
+        inst.load_shelf = lambda: None
+        inst._switch_page("我的书架")
+        root.update()
+        assert inst._shelf_tab.winfo_ismapped()
+        assert not inst._exports_tab.winfo_ismapped()
+        assert inst._shelf_active_tab == "shelf"
+
+        shelf = inst.shelf_frame
+        inst._show_shelf_tab("exports")
+        root.update()
+        assert inst._shelf_active_tab == "exports"
+        assert inst._exports_tab.winfo_ismapped()
+        assert not inst._shelf_tab.winfo_ismapped()
+        assert shelf.winfo_exists(), "switching tabs must not destroy the shelf list"
+
+        inst._show_shelf_tab("shelf")
+        root.update()
+        assert inst._shelf_tab.winfo_ismapped()
+        assert inst.shelf_frame is shelf
+    finally:
+        root.destroy()
+
+
+@test
+def test_the_global_status_bar_only_shows_away_from_the_workshop():
+    """书架/删除/清理的反馈必须在当前页面看得见。
+
+    工坊自己有详细状态行，全局条在那里隐藏，避免同一句话出现两遍。
+    """
+    root, inst = _make_instance()
+    try:
+        inst.load_shelf = lambda: None
+        inst._switch_page("我的书架")
+        root.update()
+        assert inst.global_status_bar.winfo_ismapped(), "global status bar missing on shelf"
+        inst.status.set("已加入队列 2 本。")
+        root.update()
+        assert inst.status.get() == "已加入队列 2 本。"
+        assert inst.global_status_label.winfo_ismapped()
+
+        inst._switch_page("下载工坊")
+        root.update()
+        assert not inst.global_status_bar.winfo_ismapped(), (
+            "the workshop already shows status in its footer")
+    finally:
+        root.destroy()
+
+
 def main() -> int:
     failures = 0
     for fn in ALL:

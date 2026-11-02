@@ -246,6 +246,81 @@ def test_all_sidebar_pages_keep_content_on_revisit():
         root.destroy()
 
 
+def test_history_page_pages_instead_of_building_every_row():
+    """下载记录一页只建 40 行，不把 200 条一次性铺成 1400 个控件。
+
+    旧实现每行 3 个 CTk 控件；窗口缩放时 Tk 要重排全部，单次接近 1 秒。
+    """
+    log = Path(app.LOG_DIR) / "desktop-history.log"
+    log.write_text("\n".join('DONE {"title": "历史书%d", "chapters": 10}' % i
+                            for i in range(200)) + "\n", encoding="utf-8")
+    root, inst = _make_instance()
+    try:
+        inst.load_shelf = lambda: None
+        inst._switch_page("下载记录")
+        root.update()
+
+        texts, labels, buttons = [], [], []
+
+        def collect(widget):
+            for child in widget.winfo_children():
+                try:
+                    text = child.cget("text")
+                    if isinstance(text, str) and text:
+                        texts.append(text)
+                        if type(child).__name__ == "Label":
+                            labels.append(text)
+                        if type(child).__name__ == "CTkButton":
+                            buttons.append((text, child))
+                except Exception:
+                    pass
+                collect(child)
+
+        collect(inst.pages["下载记录"])
+        joined = "\n".join(texts)
+        assert "第 1 /" in joined, joined[:500]
+        assert "共 20" in joined, joined[:500]
+        assert len(labels) < 120, "too many row labels built at once: %d" % len(labels)
+        next_button = next(button for label, button in buttons if label == "下一页")
+        next_button.invoke()
+        root.update()
+        texts.clear(); collect(inst.pages["下载记录"])
+        assert any("第 2 /" in text for text in texts), texts[:20]
+    finally:
+        log.unlink(missing_ok=True)
+        root.destroy()
+
+
+def test_pages_are_stacked_instead_of_repacked():
+    """切页只该把页面提到最上层，不能让 Tk 重新计算整页几何。
+
+    旧实现每次切换都 pack_forget 旧页再 pack 新页，页面高度随下载面板收起/
+    展开而变，视觉上就是整屏闪一下、像在重新排布窗口。
+    """
+    root, inst = _make_instance()
+    try:
+        inst.load_shelf = lambda: None
+        inst._switch_page("我的书架")
+        root.update()
+        shelf = inst.pages["我的书架"]
+        assert shelf.winfo_manager() == "place", shelf.winfo_manager()
+        size = (shelf.winfo_width(), shelf.winfo_height())
+
+        inst._switch_page("下载工坊")
+        root.update()
+        assert not shelf.winfo_ismapped()
+        assert inst.workshop_footer.winfo_manager() == "place"
+
+        inst._switch_page("我的书架")
+        root.update()
+        assert inst.pages["我的书架"] is shelf
+        assert (shelf.winfo_width(), shelf.winfo_height()) == size, (
+            "the page was re-laid out by the switch")
+        assert not inst.workshop_footer.winfo_ismapped()
+    finally:
+        root.destroy()
+
+
 if __name__ == "__main__":
     for name, case in tuple(globals().items()):
         if name.startswith("test_"):

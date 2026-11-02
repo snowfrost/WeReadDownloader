@@ -200,9 +200,15 @@ def test_card_cover_applies_a_real_image_instead_of_swallowing_a_name_error():
 
         widget = instance.card_widgets["cover-live"]
         assert widget["image"] is not None, "cover image was not applied"
-        label = widget["cover"]
-        assert label.cget("image") is not None, "label has no image"
-        assert label.cget("text") == "", "label still shows placeholder text"
+        # 结果行现在画在 Canvas 上（_ResultCanvas），不再是一个带 image 的
+        # CTkLabel；所以这里校验 canvas 真的多了一个 image 项、并且照片被
+        # 画布持有——这正是"解出来的图有没有落到屏幕上"。
+        canvas = instance.results.canvas
+        images = [item for item in canvas.find_all()
+                  if canvas.type(item) == "image"]
+        assert images, "no cover image item was drawn on the result canvas"
+        assert "cover-live" in instance.results._photos, instance.results._photos
+        assert widget["cover"].cget("text") == "", "row still shows placeholder text"
     finally:
         root.destroy()
 
@@ -266,6 +272,11 @@ def test_a_small_cached_cover_is_not_stretched_into_the_detail_slot():
         instance.cover_image = None
         instance.cover_cache["cover-url"] = small
         instance._show_book_info({"cover": "cover-url", "bookId": "1"})
+        # The refetch runs on a worker thread; under a loaded suite it may not
+        # have been scheduled by the time the call returns.
+        deadline = time.time() + 2.0
+        while not requested and time.time() < deadline:
+            time.sleep(0.01)
 
         assert requested == ["cover-url"], (
             "expected a refetch for the detail slot, got %r" % (requested,))

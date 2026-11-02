@@ -243,6 +243,371 @@ WeReadWorker.exe (CLI 引擎)
 
 ## 四、变更日志（Keep a Changelog 格式）
 
+### 2026-11-02 (2) 书架标注「已下载 / 未完成」（**Added**）
+
+- **后端 `_export_index()`**：扫一次 `OUTPUT`，把目录名 `<书名>-<bookId>`
+  解析成 `bookId → done / partial`。`.work` 后缀、`_stale-` 前缀、以及没有 epub 的目录
+  都算 `partial`；同一本书既有成品又有残留时以 `done` 为准。
+- **`load_shelf()` 附带状态**：书架数据返回前给每一本加上 `download` 字段
+  （`done` / `partial` / 空），前端不用再猜。
+- **新增 `local_state()`**：只返回这张索引表，供「存储占用」删除文件后刷新标记用，
+  避免为了一次标记变化重新拉整张书架（那要走网络和 worker）。
+- **前端**：`.shelf-card.done` 绿色左边条 + 淡绿底 + 「已下载」小徽标；
+  `.shelf-card.partial` 琥珀色同样处理，徽标写「未完成」。计数行变成
+  「共 97 本 · 已下载 9 · 未完成 1」。
+- **实时更新**：`download_done` 事件到达时直接给对应卡片加标记；`storage_changed`
+  事件（删除/清理导出）到达时调 `local_state()` 重算，被删掉的书会立刻褪色。
+- **实测（本机真实书架）**：97 本里识别出 9 本已下载、1 本未完成；徽标宽度 39px
+  全部落在卡片内；模拟删除后卡片正确褪色，计数从「已下载 9」变回「共 97 本」。
+- **测试**：`tests/test_web_shell.py` 增至 12 条，新增导出索引解析（含 `.work` /
+  `_stale-` / 无书号目录）与「书架必须能看出已下载」两条。
+
+### 2026-11-02 双击后「界面出来但没反应」：桥接枚举把 Window 一起走了一遍（**Fixed**）
+
+**现象**：双击 exe，窗口正常出现，但点任何按钮都没有反应，看上去像整个界面卡死。
+
+**定位**（`boot.log` 与 CDP 实测）：
+
+- 失败时页面里的 `window.pywebview.api` 是**空对象**：`Object.keys(...).length === 0`，
+  `boot()` 重试 40 次后放弃，状态栏停在「界面桥接未就绪」。
+- 连续 4 次冷启动里有 2 次是这样；`page ready` 的耗时在 1.0–7.2 秒之间大幅波动。
+- 读 pywebview 源码：`util.inject_pywebview()` → `get_functions(window._js_api)`
+  会**递归遍历 js_api 对象的每个公开属性**（不是方法就继续往下走）。我们把 `WebApi`
+  实例直接当 `js_api` 传进去，于是它在 UI 线程上把 `self.window`（活的 WebView2
+  Window）、`self.service`、队列、字典全部走一遍。走完才有桥接；走慢了桥接来得晚，
+  走挂了桥接就是空的。
+
+**改法**：
+
+- **新增 `_JsApiFacade`**：只暴露 27 个可调用方法（`__dir__` 直接返回方法名列表），
+  把 `window / service / events / queue / selected` 这些状态挡在外面。枚举从「遍历整个
+  对象图」变成「列一遍方法名」。
+- **事件改为页面主动拉取**（`poll_events`，JS 每 120ms 一次）。原来的
+  `_forward_events` 线程用 `window.evaluate_js()` 推事件，而 pywebview 的实现是
+  `webview.Invoke(...)` + `semaphore.acquire()`，**没有超时**，回调又排在 UI 线程的
+  调度器上——UI 一忙，推送线程就永久挂住。现在 Python 不再调用任何 Python→JS 的接口。
+- **启动重试改成「先密后疏、一直等」**：前 40 次 250ms，之后 1 秒一次，不再 10 秒就
+  宣布失败；等待期间状态栏显示「界面初始化中…」。
+- **新增 `_watch_readiness`**：25 秒内页面没有回报就绪，就往 `boot.log` 写
+  `page never reported ready in 25s (bridge likely empty)`，这类静默故障以后有据可查。
+- 页面 `report_ready` 会把它看到的桥接方法数、版本号、耗时写进 `boot.log`。
+
+**实测（安装目录版本）**：
+
+| 指标 | 改之前 | 改之后 |
+|---|---|---|
+| 冷启动就绪率 | 6 次里 4 次（另 2 次空桥接） | **8/8**，随后再测 **5/5** |
+| 就绪耗时 | 1000–7248ms | **575–717ms** |
+| 桥接方法数 | 0 或 30 | 稳定 27 |
+| 功能 | 按钮无响应 | 搜索「道诡异仙」2 条、详情简介与封面（naturalWidth 250）正常 |
+
+**测试**：`tests/test_web_shell.py` 增至 10 条，新增「js_api 只暴露方法，window/service
+等不得泄漏」「页面拉取事件而非 Python 推送」两条。
+
+**仍未解释清楚的部分**：空桥接到底是遍历「慢到超过预算」还是「遍历中途抛异常」，
+我没有拿到确定证据（pywebview 内部异常被它自己 log 掉了，窗口版看不到）。改法避开了
+这条路径而不是修好它，属于「绕开根因」而非「证明根因」。信心见报告。
+
+### 2026-10-29 (7) 封面全空 / 详情一直是「加载中」 / 书架书名溢出（**Fixed**）
+
+三处都是 WebView 前端的显示缺陷，与后端、worker、下载链路无关。
+
+- **封面永远不显示（`Fixed`）**。`coverNode()` 给 `<img>` 设了
+  `loading="lazy"`，又只在 `onload` 里把图 append 进 DOM：懒加载的图片不在文档里
+  就**永远不发起请求**，不请求就没有 `onload`，没有 `onload` 就不 append——死循环。
+  于是每本书都停在占位文字「封面」。改为新增 `fillCover()`：占位文字与 `<img>`
+  **同时插入**，图片绝对定位覆盖占位；`load` 时给容器加 `.has-image`，
+  `error` 时移除 `<img>` 并把占位文字改成「暂无封面」。卡片、书架、详情三处共用。
+- **详情区一直显示「加载中」（`Fixed`）**。同一根因：`renderDetail()` 里
+  `if (!img.complete) box.textContent = "加载中"` 永远不会被覆盖。改用
+  `fillCover()` 后详情封面正常出现，简介、作者等信息本来就正常返回
+  （实测《道诡异仙》简介 67 字、封面 naturalWidth 250）。
+- **书架书名溢出卡片（`Fixed`）**。`.shelf-card` 的栅格是 `40px 1fr auto`：
+  `1fr` 等价 `minmax(auto, 1fr)`，会保留标题的 min-content 宽度，长书名把卡片
+  撑破。改为 `40px minmax(0, 1fr) auto`，并给 `.shelf-title` 加 `min-width: 0`，
+  省略号才生效。实测 97 本真实书架：所有标题都在卡片内截断，无溢出。
+- **封面 CSS（`Changed`）**：`.result-cover` / `.cover` 加 `position: relative`，
+  内部 `img` 改 `position: absolute; inset: 0`，图片与占位文字不再抢栅格行。
+- **测试**：`tests/test_web_shell.py` 增 2 条——禁止裸懒加载（`loading="lazy"`
+  与「只在 onload 里 append」都要挡掉）、书架栅格必须是 `minmax(0, 1fr)`。
+  共 6 条通过。
+- **已知环境限制（不是代码问题）**：用户书架 97 本里 57 本封面在
+  `cdn.weread.qq.com`。该域名在**本机**不可达——`curl`（Windows schannel）
+  报 `(35) failed to receive handshake`，`requests` 报
+  `SSL: UNEXPECTED_EOF_WHILE_READING`，`http://` 直接空响应，`-4`/`-6` 均失败；
+  同机 `wfqqreader-*.image.myqcloud.com` 返回 200。所以这 57 本只能显示
+  「暂无封面」，任何客户端（含原 Tk 版）在这条网络上都取不到。
+
+### 2026-10-29 (6) 前端换壳：Tk → WebView2（pywebview），缩放与切页不再掉帧（**Changed**）
+
+**为什么换**：Tk/CTk 的整窗重绘有地板价——纯 Tk 空页放进主界面，缩放 5 次仍要
+0.9–1.3 秒（约 200ms/次），再怎么改业务代码也消不掉。用户实测「其他四页全屏/窗口化
+还是一样」，因此把前端层整体换成 WebView2 渲染的 HTML/CSS/JS，Python 退到后端。
+
+- **新增 `weread/web_app.py`（后端桥）**。一个 `WebApi` 类，通过 `js_api` 暴露
+  25 个方法：`boot / check_auth / login_qr / login_otp / logout / search /
+  book_info / probe / download / cancel / queue_* / shelf / exports / delete_* /
+  history / storage / settings / open_*`。worker 协议、`ServiceClient`、登录、
+  队列逻辑全部复用，界面层不再碰 subprocess。
+- **新增 `weread/webui/`（前端）**。`index.html + style.css + app.js`，沿用夜航配色
+  （`#0B1322` 底 / `#131E30` 面板 / 香槟金 `#E4B863`），五个页面：下载工坊、我的书架、
+  下载记录、存储占用、设置；搜索/书架/记录/存储/队列都走事件推送。
+- **新增 `packaging/WeReadWeb.spec`**，产物 42MB（Tk 版 92MB）。
+- **冻结路径解析（`Fixed`）**。`_webui_index()` 依次尝试源码目录、`_MEIPASS`、
+  `_internal/weread/webui`、exe 同级目录。首次打包报 `ERR_FILE_NOT_FOUND` 就是
+  `__file__` 在冻结后不在 `weread/` 下。
+- **桥接注入竞态（`Fixed`）**。冻结包里 `window.pywebview.api` 对象先出现、方法后注入，
+  旧 `api()` 直接调用导致 `TypeError` 打断 `boot()`，界面打开但版本号空白、按钮全哑。
+  现在 `api()` 在方法不是函数时返回 `{ok:false}`，`boot()` 按 250ms 重试最多 40 次，
+  重试耗尽在状态栏提示「界面桥接未就绪，请关闭后重新打开」。`bindUi()` 幂等。
+- **WebView2 profile 隔离（`Fixed`）**。WebView2 独占 user-data 目录；被强杀的旧实例
+  留下的 `msedgewebview2` 残留进程会占住目录，新实例于是拿到一个**空桥接**
+  （窗口正常、页面正常、所有按钮无反应）。现在每次启动用
+  `PRIVATE/webview/run-<pid>`，启动时清理 24 小时前的旧目录，退出时删除自己的。
+  登录态在 `cookies.json`，不依赖浏览器 profile。
+- **结果行栅格修正（`Fixed`）**。`.result-card` 是
+  `check / cover / 文本 / 按钮` 四个子元素，旧模板 `44px 1fr auto auto` 把 40px 封面
+  塞进 1fr 列，书名整体右移；改为 `18px 40px minmax(0,1fr) auto`。
+- **启动自检（`Added`）**。窗口版没有控制台，`boot.log` 记录 frozen 状态、exe 路径、
+  api 方法数、index 路径、profile 路径，并在 4s/10s 用 `evaluate_js` 回读
+  `Object.keys(window.pywebview.api).length` 与页面版本号——「打开但点不动」这类
+  静默故障以后有据可查。
+- **实测（安装目录版本，1240×820）**：连续 5 次改窗口，rAF 帧间隔
+  **avg 17ms / max 18ms**（稳定 60fps；Tk 版每次约 200ms）；五页切换
+  **avg 3.1ms / p95 9.1ms / max 13.9ms**（Tk 版约 85ms）；
+  真实搜索「道诡异仙」返回 2 条并渲染，worker 从 `..\WeReadWorker` 正常拉起。
+- **测试**：新增 `tests/test_web_shell.py` 4 条（资源随包、每次运行独立 profile 且清理旧目录、
+  结果行栅格、`api()` 不同步抛错）。
+- **修正一条陈旧断言（`Fixed`，测试）**。`test_card_cover_applies_a_real_image…` 一直失败，
+  之前被我误判成「满载并行下的时序 flake」——单独跑同样失败，是**真回归**：结果行在阶段一
+  已改为 Canvas 绘制，照片走 `_ResultCanvas.set_cover()` 存进 `_photos` 并画成 image 项，
+  而断言还在查旧 `CTkLabel.cget("image")`。改为校验 canvas 上确有 image 项 + `_photos` 持有该
+  bookId；顺带 `_apply_card_cover` 的 except 不再静默，失败写 `[COVER] card cover failed` 日志。
+- **安装**：`D:\Program Files\WeReadDownloader\WeReadDesktop\` 已替换为 WebView 版；
+  旧 Tk 的 `_internal` 备份为 `_internal_tk_bak`，回滚可用
+  `build_dist_visual4/WeReadDesktop` 里的 exe。
+- **未覆盖**：扫码登录/短信登录、队列整链、导出删除确认弹窗尚未在 WebView 版点过一遍。
+
+### 2026-10-29 (5) 其他四页缩放：滚条重绘合并 / 隐藏页不再重排 / 记录分页（**Changed / Fixed**）
+
+- **隐藏的工坊不再参与缩放（`Fixed`）**。`_fit_body_to_window` 在
+  `_current_page != "下载工坊"` 时直接返回。之前在其他四页最大化/还原时，
+  看不见的工坊 body 仍在重算高度、重排 CTkScrollableFrame，等于把缩放成本翻倍。
+- **滚动条重绘合并（`Fixed`）**。profiler 显示 `CTkScrollbar.set()` 单次
+  70–120ms（内部会 `update_idletasks()`），而 Tk 每个 Configure 都触发
+  `yscrollcommand`。新增 `_throttled_scrollbar_sync()`：同一分位只更新一次；
+  窗口缩放期间（350ms 内有 Configure）延后到停止后 260ms 再画，滚动时 16ms 合并。
+  结果列表、书架列表、所有页面滚动容器统一走它。
+- **Canvas 字体缓存（`Changed`）**。结果行/书架行每画一次都新建 CTkFont，
+  现在每个 Canvas 实例内按 (字号, 字重) 缓存，重绘不再重复解析字体。
+- **下载记录分页（`Changed`）**。旧版一次铺 200 行 × 3 个 CTk 控件（约 1400 个
+  widget），缩放一次接近 1 秒；现在每页 40 行、行内用原生 `tk.Label`，
+  整页 widget 数降到约 146，并带「上一页 / 下一页 / 第 n 页」。
+- **测试**：`test_page_switch.py` 增"记录页只建 40 行、可翻页"；全量 551 passed
+  （另有 1 条既有封面测试在满载并行时偶发时序失败，单独运行通过，不是功能回归）。
+- **限制**：Tk/CTk 的整窗重绘本身有地板价（同样结构原生 Tk 约 1/4 成本，
+  但把四个页面全部改原生控件会牺牲圆角与统一外观）。本轮先把重复重绘和
+  隐藏页重排去掉；若还嫌慢，下一步是把设置/存储等静态页的行改成原生控件。
+
+### 2026-10-29 (4) 切页/最大化闪动：页面叠放 + 重绘合并（**Changed / Fixed**）
+
+- **页面改为叠放（`Changed`）**。`page_host` 里新增 `page_stack`，所有页面
+  `place(relwidth=1, relheight=1)`；切换只 `lift()` 目标页并 `place_forget` 其余页。
+  旧实现每次 `pack_forget` 旧页再 `pack` 新页，会让 Tk 重算整页几何；配合底部
+  下载面板的 pack 收起/展开，页面高度在"整屏"和"整屏减面板"之间跳变，看起来就是
+  整屏闪一下、像在重新排布窗口。
+- **下载面板改为叠放（`Changed`）**。③ 面板从 `pack(side=bottom)` 改为
+  `place(relx=0, rely=1, anchor="sw", relwidth=1)`，不再参与 page_stack 的高度分配；
+  `_fit_body_to_window` 从可用高度里扣掉面板实际高度，避免最后几行被盖住。
+- **Canvas 缩放重绘合并（`Fixed`）**。结果列表和书架列表的 `<Configure>` 从
+  "每一发都 delete 全部重画"改为 90ms 合并；尺寸没变直接返回。最大化/还原时不再
+  连续整表重绘。重绘回调加了控件已销毁的守卫。
+- **工坊高度重算合并（`Fixed`）**。`_fit_body_to_window` 改为 70ms 防抖，只认
+  root 的尺寸变化；body 高度变化时如果用户本来停在页面底部，保持贴底。
+- **导航字体复用（`Changed`）**。每个导航项预建 active/idle 两个 `CTkFont`，
+  切页不再为 5 个导航项反复新建字体对象。
+- **实测（本机 1120×680，合成数据）**：连续 5 次窗口尺寸变化只触发 5 次列表重绘
+  （旧逻辑每个 Configure 一次）；页面切换合成耗时从 pack 方案约 105ms 降到约 85ms。
+  **限制**：Tk 没有离屏合成，整页重绘本身仍约 80ms，要再显著下降只能减少页面
+  控件数或更换 UI 技术栈。
+- **测试**：`test_page_switch.py` 新增"页面用 place 叠放、切回后尺寸不变"；
+  全量 551 passed。
+
+### 2026-10-29 (3) 全局状态条 + 队列当前项 + 书架按钮降噪（**Changed / Fixed**）
+
+- **全局状态条（`Added`）**。`main` 底部新增 26px 状态条，绑定同一个 `self.status`
+  并同步语义着色；只在非工坊页面出现（工坊 footer 已有更详细的状态行，避免同一句
+  话出现两遍）。书架入队、删除、清理的反馈从此在当前页面可见，不再依赖回到工坊。
+- **修队列"运行中却显示空队列"（`Fixed`）**。`download_queue` 在启动时会把当前书
+  弹出，旧弹窗只渲染它，所以最后一本下载中点「队列」会看到"队列是空的"。现在
+  弹窗顶部单独一行「正在下载」+ 标题 + 进度百分比；顶栏按钮计数也把当前项算进去
+  （`_refresh_queue_button`），暂停时当前书回队列，不重复计数。
+- **书架行按钮降噪（`Changed`）**。每行「下载」从实心香槟金改为深色安静按钮
+  （SUNKEN 底 + BORDER 边 + 主文字），金色只留给页签选中态、工坊主按钮和关键数字；
+  15 行金色按钮并排会把整页变得像工具栏。
+- **测试**：`test_shelf_page.py` 增全局状态条显隐；`test_desktop_queue_lifecycle.py`
+  增"当前书在跑、队列为空也要显示正在下载"。全量 550 passed。
+- **未做**：工坊三栏比例与底部面板再压缩、原生 messagebox 换皮、书架封面/行悬停细化。
+
+### 2026-10-29 (2) 夜航深色基础 + 我的书架双页签（**Changed**）
+
+本轮开始阶段二的可视层，先落"底"和一页结构，不动下载逻辑。
+
+- **全局色板换成 Nocturne 深色（`Changed`）**。`BG #0B1322`、`CARD #131E30`、
+  `SUNKEN #0F1826`、`BORDER #2E405C`、主文字 `#F2F5FA`；唯一强调色改为香槟金
+  `#E4B863`，实心金按钮上的文字改用 `ON_ACCENT #141008`（白字在金底上对比度不够）。
+  语义色改为暗底版本：成功 `#7FD1A3`、失败 `#E88B84`、警告 `#E0B36A`。
+  `ctk.set_appearance_mode("dark")` + `dark-blue` 主题。
+  **限制说明**：CustomTkinter 没有真正的背景模糊/饱和度，玻璃层用"预混合的深色面板 +
+  细边框"表达；不承诺 CSS backdrop-blur 效果。
+- **Canvas 自绘件同步换色（`Changed`）**：结果行/书架行的勾选对勾、下载按钮文字从
+  白色改为深墨色，避免金底白字发虚；`_Scroller` 兜底色改深色。
+- **我的书架拆成两个满高页签（`Changed`）**。旧布局把「微信书架」和「本机已导出」
+  上下叠在一张卡里：书架固定 300（最多 560），导出列表再固定 300，结果书架太短、
+  导出又太高。现在两个页签各占满剩余高度，列表在内部滚动；切换页签重建内容但
+  不销毁书架列表。书架最小高度 320、上限放宽到 760（实际由 expand 决定），
+  页签按钮显示当前态（香槟金描边 + 暗金底）。
+- **导航选中态收敛（`Changed`）**。原来用 3px 香槟金四边框，在深色底上像键盘焦点框；
+  改为 `SIDE_ACTIVE` 抬起面 + 亮色粗体，不再有亮金外框。
+- **测试**：`test_shelf_page.py` 新增"两个满高页签、切换不销毁书架"；`test_nav_click.py`
+  的选中态断言从 border_width=3 改为抬起面/亮色文字。全量 548 passed。
+- **仍未做**：工坊三栏重排、书架行视觉细化、队列当前项、全局状态反馈、原生弹窗换皮。
+
+### 2026-10-29 (1) 阶段一性能重构：搜索结果合并渲染 / 封面统一加载 / 主线程减负 / 关闭非阻塞（**Changed / Fixed**）
+
+本轮只治"卡"，不动视觉，也不碰下载协议。所有改动集中在 `weread/desktop_app.py`。
+
+- **搜索结果合并渲染（`Changed`）**。旧行为：15 条结果逐条到达，每条命中当前页就
+  `_render_page()`，等于 15 次整页重绘 + 最多 120 次封面请求调度。现在
+  `_add_book_card()` 在事件批次内只置脏标记，`_drain_events()` 收尾统一渲染一次；
+  直接调用（测试/单条）仍立即渲染。实测 15 条：177ms → 83ms（本机，含解析）。
+- **统一封面加载器（`Added`）**。新增 `_request_cover()`：URL 级在途去重、最多 4 路
+  并发（复用原 `cover_slots`）、按 (URL, 尺寸) 缓存、403/404 负缓存（超时/断网不缓存）、
+  流式下载边读边限 8 MiB。卡片/书架/详情三条路径全部改走它；顺带删掉每张封面
+  追加到 `_image_refs` 的终身引用（画布 `_photos` 与 `widget["image"]` 已持有）。
+- **复选框不再扫盘（`Fixed`）**。`_on_local_check` / `_selected_local_rows` /
+  全选改读页面构建时的 `_local_rows_snapshot`，不再为勾一个框递归 `stat` 全部导出
+  目录。`_scan_exports()` 的目录求和从 `rglob("*")+is_file()` 改为 `os.walk`：
+  1 万个文件实测 195ms → 108ms（约 1.8 倍）。
+- **历史记录只读日志尾部（`Changed`）**。新增 `_read_log_tail()`（默认 64 KiB/文件，
+  最多 200 个日志），不再为 200 条记录读全部 `desktop-*.log`。
+- **事件循环按时间预算 + 单事件隔离（`Changed`）**。除 200 条计数上限外，图片类事件
+  超过 25ms 预算即让出主线程；每条事件独立 try/except，一条坏消息不再吞掉后面的
+  `done`（窗口因此不会卡在"忙"）。有积压时下一 tick 8ms 而非固定 100ms。
+- **关闭流程非阻塞（`Fixed`）**。`_ServiceClient.terminate()` 不再抢请求正在持有的锁，
+  直接摘句柄并 kill；所有 worker 从 `Popen` 返回即登记进 `_live_workers`（此前
+  spawn 未认领的进程不在任何登记表里，关窗会漏杀）；回收在后台线程做。
+  日志 flush 超时 3s → 1s。
+- **性能埋点（`Added`）**：`[PERF] render_page ...ms`（>50ms）、
+  `[PERF] scan_exports ...ms`（>80ms）、`[EVENT_ERROR]`，为下一阶段提供基线。
+- **测试**：新增 `tests/test_desktop_perf.py`（8 条）：合并渲染只渲染一次、同 URL 只
+  取一次、缓存命中不联网、勾选不扫盘、坏事件不阻塞 done、日志只读尾部、terminate
+  不等待、spawn 未认领也被关闭回收。全量 547 passed（带 Lua 插件目录实跑）。
+- **未做（留给阶段二）**：页面视觉重排、书架/导出拆页、队列当前项展示、busy 按资源域
+  拆分、初始扫盘后台化。本轮不改变任何下载/EPUB 行为。
+
+### 2026-10-28 (4) 空正文章节改为跳过续跑，不再废掉整本书（**Changed / Added**）
+
+**动机**（本机实测：《哈佛新编中国现代文学史》《三国演义·地图珍藏本》）：微信读书
+服务端对个别章节只返回空正文（`empty body despite catalog wordCount=N`），而这类
+章节重试也不会变出正文。旧逻辑把它记进 `unresolved`，`export_book` 末尾无差别
+`raise`，于是**一章的问题废掉整本**，其余 99% 已下载的章节连 EPUB 都拿不到。
+
+- **改：内容型失败可跳过（`Changed`）**。新增 `SKIPPABLE_CHAPTER_MARKERS` /
+  `is_skippable_chapter_fault()`：空正文、无 XHTML body、明文分片解码成非文本、
+  付费占位四类算「服务端本来就没有正文」。`run_chapter_with_retries()` 新增
+  `skipped` 参数，命中时写进 `skipped` 而非 `unresolved`，打印 `[SKIPPED]` 后
+  继续下一章。**限流(426/429/403)、MD5 校验不符、TLS/超时仍走 `unresolved`
+  并中止**——那些是「稍后再试就好」，跳过去会把一次坏网络变成一本残书。
+- **增：缺章说明页（`Added`）**。`write_skipped_chapter_note()` 在该章位置写一页
+  说明（「本章正文未能获取」+ 原因 + 会重试），**不编任何正文**。review 行带
+  `skipped` 字段，`discover_checkpoint_files()` 认出它并排除，因此下次续传会
+  重新请求这一章，而不会把占位页当成「已下载」永久固化。
+- **增：缺章要报（`Added`）**。`omissions.text_complete` 在有跳过时为 `False`
+  并新增 `chapters_skipped`（UID/标题/原因）与 `reason_skipped`；
+  `describe_omissions()` 把缺章排在第一段，状态栏一行版从「正文完整」改成
+  「有章节缺失」；GUI 处理 `[SKIPPED]` 行给出可读提示。
+- **增：严格模式开关（`Added`）**。`--strict-chapters`（`skip_empty_chapters=False`）
+  退回旧行为：缺一章就不出版，便于排查/比对。默认跳过。
+- 测试：原 `test_export_resumes_...refuses_epub_when_chapter_stays_empty` 拆成两条
+  ——`test_export_skips_a_permanently_empty_chapter_and_publishes_the_rest`（默认跳过，
+  断言 EPUB 出版、manifest `chapters_skipped`、说明页文案、续传仍会重取）与
+  `test_export_refuses_epub_when_chapter_stays_empty_in_strict_mode`；
+  `test_desktop_omissions.py` 增一条「缺章不能说正文完整」。全量 539 passed
+  （带 Lua 插件目录跑，原先 skip 的 5 条 Lua 用例本轮实跑）。
+
+### 2026-10-28 (3) 关闭卡死 / 失败后按钮无响应 / 队列失败可单独重试 / 书架高度（**Fixed / Added / Changed**）
+
+- **修：窗口关不掉（`Fixed`）**。根因是状态栏语义着色的 `StringVar.trace`
+  回调：窗口销毁时控件先没了，回调里 `winfo_exists/configure` 抛 TclError →
+  经 `report_callback_exception` → `_handle_callback_exception` 里又写
+  `status.set()` → 再次触发 trace → **递归拖死消息循环**，表现即「点关闭
+  没反应、按钮全死」。修复三层：回调全程 try/except 静默；新增 `_closing`
+  旗标（`_on_close`/`shutdown` 第一行置位，回调遇到直接返回）；显式绑定
+  `WM_DELETE_WINDOW → _on_close`（先停常驻 worker 再 destroy）。实测：
+  发送 WM_CLOSE 后主进程 5 秒内退出、无残留。
+- **修：下载失败后按钮卡死（`Fixed`）**。单本自动重连的 8 秒倒计时会
+  「抢跑」——用户此时若正开着确认框或刚点了搜索，after 回调抢走任务，
+  用户接下来的点击全被「当前还有一个任务在运行」挡住。改为 15 秒 + 三条
+  让路条件（窗口已关/已有任务/有模态框在等回答），提示文案写明「你现在
+  也可以直接点重试」。
+- **增：队列失败可单独重试（`Added`）**。队列收尾时把失败的书按 bookId
+  去重后**放回 download_queue**，队列按钮计数即「还剩几本可重试」；点
+  「队列」→「开始队列下载」只重跑失败的，已成功的不会重复下载，断点续传。
+  `queue_results` 汇总按书名去重（首轮+补跑同一本只列一次）。
+- **改：书架页高度（`Changed`）**。`_ShelfCanvas` 从固定 210px（约 3 行、
+  挤在页面上半部分）改为按书数自适应 `_fit_shelf_height`（260~560px）；
+  「本机已导出」列表限高 300 并自身滚动，不再把整页拉成一条长龙。
+- 测试：`test_incomplete_queue_result_never_reports_success` 适配新语义
+  （断言「未完成」+ 失败书回到队列）。全量 511 passed。
+
+### 2026-10-28 (2) 搜索结果紧凑化 + 本机打包同步（**Changed**）
+
+- **结果行精简**：`_ResultCanvas` 行高 150 → 64，只画封面（27×38）/书名/作者，
+  分类与评分从行里移除（详情区保留完整信息）；勾选框从正文下方移到行尾
+  （与书架页一致），点击判定区域缩到框四周 8px。
+- **每页数量**：`RESULTS_PER_PAGE` 6 → 15。一屏可见书数约 2.5 倍。
+- **数据层修正**（精简暴露的真 bug）：`_finish_card_categories` 原来在
+  category widget 为 None 时直接 return，后续书的数据填充全部跳过——
+  现在数据填充与 widget 无关，label 为 None 也照填 book_rows。
+- **测试适配**：paging 测试数据 20 → 45 本（15/页下才有第 3 页）；layout
+  测试的勾选框断言改为「行尾且完整」；detail flow 测试的分类断言从
+  widget 层转到数据层。全量 511 passed。
+- **打包同步**：Python 3.12.13 + PyInstaller 6.22.3 按 `packaging/WeReadDesktop.spec`
+  重打 GUI（onedir），整目录替换 `D:\Program Files\WeReadDownloader\WeReadDesktop\`
+  （原版备份在工作区 `WeReadDesktop-backup-original/`）。worker 未动
+  （本次改动全在 GUI 侧）。冒烟：新 exe 启动正常。
+
+### 2026-10-28 四项体验改进：书架批量入队 / 失败自动补跑 / 导出管理 / UI 精修（**Added / Changed / Fixed**）
+
+- **书架批量加入队列（Added）**：`_ShelfCanvas` 每行加「队列」勾选框（canvas
+  绘制，点击区域判定与 `_ResultCanvas` 一致）；书架头部新增「全选」与
+  「加入队列 N 本」按钮。勾选状态存 `_shelf_checks`（与搜索页 `_card_checks`
+  分离，同一本书两处出现互不干扰）；队列未开跑时取消勾选会同步出队。
+- **队列失败自动补跑（Changed）**：第一轮跑完后，失败的书自动在队尾补跑一轮
+  （每本最多一次，`_queue_retried` 记账）。瞬态故障（限流坏窗口/网络抖动）
+  在第一轮后大多自愈，断点续传让第二轮只补缺章。补跑状态栏显示
+  「自动补跑：准备下载…」（`_start_one` 加 `prefix` 参数，避免默认前缀
+  覆盖补跑提示——测试抓到的真实缺陷）。
+- **单本失败自动重连（Added）**：非队列模式下 export 失败后 8 秒自动重试
+  一次（`root.after`，回调里 busy 检查防止抢用户手动起的新任务）；同一本
+  不重复（`_export_auto_retried`）。手动开始新书或点「重试」会重置该标记。
+- **本机已导出管理（Added）**：每行加复选框（`_local_checks`，key 为目录名），
+  头部新增「全选 / 删除选中 N 项 / 清半成品保EPUB / 全部删除」。
+  「清半成品保EPUB」只删 partial(.work)/stale/failed 三类目录，done 成品
+  一律不动（.work 是成品的兄弟目录，删它只损失续传能力）。
+- **UI 浅色精修（Changed）**：`_quiet_button` hover 从 SUNKEN（与卡片底色
+  只差一档灰、几乎无感）改为 ACCENT_TINT 绿染；色板新增 `BORDER` 常量并
+  替换 8 处硬编码 `#D5D9DF`；状态栏按语义着色（失败红/成功绿/进行中
+  主题绿深色，关键词优先级：失败>成功>进行中，`status.trace_add` 驱动）。
+- **测试**：全量 511 passed + 49 subtests（Python 3.12.13）。两个队列测试
+  按「失败先补跑一轮再收尾」的新语义更新（`test_a_failed_queue_book…`、
+  `test_incomplete_queue_result_never_reports_success`）。
+- 背景：贾樟柯系列下载问题溯源结论——服务端按书配置是否截断分片
+  （贾想Ⅱ/猫国物语拿到的是试读截断分片，MD5 校验自洽通过），工具端
+  三处防护（空body/price/wordCount）均拦不住「非空的少量内容」；
+  完整性检查增强另行立项，未混入本批。
+
 ### 2026-10-24 v1.0.8：MD5 重试跨坏窗口 + 真机双轮验证（**Fixed / Changed**）
 
 - **MD5 重试退避加宽**：`chapter_html` 的重试节奏从 0.5/1.0/1.5s 改为 2/8/20s。

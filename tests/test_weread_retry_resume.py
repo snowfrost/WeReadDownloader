@@ -165,7 +165,7 @@ def test_depth_limit_stops_search_before_deep_folders():
 
 
 
-def _offline_export(output_root, chapter_responses):
+def _offline_export(output_root, chapter_responses, **export_kwargs):
     """Run export_book against a fake WeRead; returns (exception|None, log, fetched_uids)."""
     import contextlib, io
     fetched = []
@@ -175,7 +175,7 @@ def _offline_export(output_root, chapter_responses):
             pass
 
         def fetch_book(self, _book_id):
-            return ({"title": "Fake Book"},
+            return ({"bookId": BOOK_ID, "title": "Fake Book"},
                     [{"chapterUid": 1, "wordCount": 0},
                      {"chapterUid": 1194, "wordCount": 0}])
 
@@ -198,7 +198,8 @@ def _offline_export(output_root, chapter_responses):
     error = None
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            wd.export_book(BOOK_ID, output_root, {"cookies": {}}, jobs=1)
+            wd.export_book(BOOK_ID, output_root, {"cookies": {}}, jobs=1,
+                           **export_kwargs)
     except RuntimeError as exc:
         error = exc
     finally:
@@ -221,7 +222,42 @@ def _seed_completed_chapter(workspace, uid, index):
         "embedded_markers": 0}), encoding="utf-8")
 
 
-def test_export_resumes_from_parent_output_and_refuses_epub_when_chapter_stays_empty():
+def test_export_skips_a_permanently_empty_chapter_and_publishes_the_rest():
+    """默认行为：一章没有正文，跳过它，其余照常出版，并说明缺了哪章。"""
+    # Let conftest report a missing plugin before the helper captures RuntimeError.
+    wd.lua_runtime()
+    with tempfile.TemporaryDirectory() as temp:
+        output_root = Path(temp) / "exports"
+        workspace = output_root / "old-run" / "Fake Book-12345.work"
+        _seed_completed_chapter(workspace, 1, 1)
+        empty = "<html><head></head><p>no body here</p></html>"
+        error, log, fetched = _offline_export(output_root, [empty, empty, empty])
+        assert error is None, "一章空正文不该让整本书失败：%s" % error
+        assert fetched == ["1194"] * 3, fetched
+        assert "[RESUME] Reusing 1 complete chapter(s)" in log, log
+        assert "[SKIPPED] chapter UID 1194" in log, log
+        assert "[UNRESOLVED]" not in log, log
+        epubs = list(output_root.rglob("*.epub"))
+        assert len(epubs) == 1, "跳过一章之后整本书仍然要出版"
+        import json
+        manifest = json.loads(
+            (epubs[0].parent / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["omissions"]["text_complete"] is False
+        assert [item["chapterUid"] for item in
+                manifest["omissions"]["chapters_skipped"]] == ["1194"]
+        # 占位页必须写明"没有正文"，不能长得像正文。
+        note = (workspace / "chapter-uid-1194.body").read_text(encoding="utf-8")
+        assert "本章正文未能获取" in note
+        assert "no body here" not in note
+        # 跳过的章节不能被当成"已下载"，下次续传还要再取。
+        assert "1194" in (workspace / "skipped_chapters.json").read_text(encoding="utf-8")
+        cached = wd.discover_checkpoint_files(workspace, [
+            {"chapterUid": 1}, {"chapterUid": 1194}])
+        assert "1194" not in cached
+
+
+def test_export_refuses_epub_when_chapter_stays_empty_in_strict_mode():
+    """--strict-chapters：退回旧行为，缺一章就不出版。"""
     # Let conftest report a missing plugin before the helper captures RuntimeError.
     wd.lua_runtime()
     with tempfile.TemporaryDirectory() as temp:
@@ -230,11 +266,10 @@ def test_export_resumes_from_parent_output_and_refuses_epub_when_chapter_stays_e
         _seed_completed_chapter(workspace, 1, 1)
         empty = "<html><head></head><p>no body here</p></html>"
         error, log, fetched = _offline_export(
-            output_root, [empty, empty, empty])
+            output_root, [empty, empty, empty], skip_empty_chapters=False)
         assert error is not None, "an incomplete book must not publish an EPUB"
         assert "remain unresolved" in str(error)
         assert fetched == ["1194"] * 3, fetched
-        assert "[RESUME] Reusing 1 complete chapter(s)" in log, log
         assert "[UNRESOLVED] chapter UID 1194 marked INCOMPLETE" in log
         assert not any(output_root.rglob("*.epub")), "no EPUB may exist for an incomplete book"
         assert (workspace / "failed_chapters.json").is_file()
@@ -253,7 +288,8 @@ if __name__ == "__main__":
         test_multiple_workspace_candidates_for_one_book_is_an_error,
         test_other_books_workspaces_are_ignored_and_new_path_is_returned,
         test_depth_limit_stops_search_before_deep_folders,
-        test_export_resumes_from_parent_output_and_refuses_epub_when_chapter_stays_empty,
+        test_export_skips_a_permanently_empty_chapter_and_publishes_the_rest,
+        test_export_refuses_epub_when_chapter_stays_empty_in_strict_mode,
     ):
         test()
         print("PASS", test.__name__)

@@ -115,10 +115,10 @@ def test_all_results_are_kept_even_though_only_one_page_is_built():
     """Paging must not lose rows: everything stays reachable via the pages."""
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
-        assert len(instance.result_rows) == 20, len(instance.result_rows)
-        assert len(instance.book_rows) == 20, len(instance.book_rows)
-        # Only a page of widgets exists, not 20 of them.
+        _feed(instance, 45)
+        assert len(instance.result_rows) == 45, len(instance.result_rows)
+        assert len(instance.book_rows) == 45, len(instance.book_rows)
+        # Only a page of widgets exists, not 45 of them.
         assert len(instance.results.content.winfo_children()) == app.RESULTS_PER_PAGE, (
             "built %d cards, expected one page of %d"
             % (len(instance.results.content.winfo_children()), app.RESULTS_PER_PAGE))
@@ -130,9 +130,9 @@ def test_all_results_are_kept_even_though_only_one_page_is_built():
 def test_pager_reports_the_page_count():
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
+        _feed(instance, 45)
         total = instance._page_count()
-        assert total == -(-20 // app.RESULTS_PER_PAGE), total
+        assert total == -(-45 // app.RESULTS_PER_PAGE), total
         assert "1 / %d" % total in instance.page_label.cget("text"), (
             instance.page_label.cget("text"))
     finally:
@@ -143,7 +143,7 @@ def test_pager_reports_the_page_count():
 def test_next_and_previous_walk_every_result():
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
+        _feed(instance, 45)
         seen = []
         for _ in range(instance._page_count()):
             seen.extend(w for w in instance.card_widgets)
@@ -177,7 +177,7 @@ def test_pager_is_hidden_until_there_is_more_than_one_page():
         _feed(instance, 2)
         assert not instance.page_bar.winfo_ismapped(), (
             "pager should stay hidden for a single page of results")
-        _feed(instance, 20)
+        _feed(instance, 45)
         instance._render_page()
         root.update()
         assert instance.page_bar.winfo_ismapped(), "pager should appear for 20 results"
@@ -189,7 +189,7 @@ def test_pager_is_hidden_until_there_is_more_than_one_page():
 def test_pager_buttons_disable_at_the_ends():
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
+        _feed(instance, 45)
         assert instance.prev_button.cget("state") == "disabled"
         assert instance.next_button.cget("state") == "normal"
         instance._turn_page(instance._page_count() - 1)
@@ -204,7 +204,7 @@ def test_a_fresh_search_resets_paging_and_discards_the_old_page():
     """A stale page must never survive into a new search."""
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
+        _feed(instance, 45)
         instance._turn_page(2)
         assert instance.page_index == 2
 
@@ -235,7 +235,7 @@ def test_rendering_a_page_stays_far_below_the_unresponsive_threshold():
     """
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
+        _feed(instance, 45)
         root.update()
 
         # Warm-up render: the first one also pays for font metrics and widget
@@ -260,7 +260,7 @@ def test_rendering_a_page_stays_far_below_the_unresponsive_threshold():
         root.update()
 
         started = time.perf_counter()
-        _feed(instance, 20)
+        _feed(instance, 45)
         root.update()
         first_ms = (time.perf_counter() - started) * 1000
         assert first_ms < 2000, "first page of 20 results blocked %.0f ms" % first_ms
@@ -277,7 +277,7 @@ def test_card_widgets_stay_in_sync_with_the_visible_page():
     """
     root, instance = _make_gui()
     try:
-        _feed(instance, 20)
+        _feed(instance, 45)
         visible = {str(row["bookId"]) for row in instance._page_slice()}
         assert set(instance.card_widgets) == visible, (
             "card_widgets has %d entries, page shows %d"

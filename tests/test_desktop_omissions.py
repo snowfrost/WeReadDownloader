@@ -73,6 +73,19 @@ def test_a_complete_book_says_nothing():
 
 
 @test
+def test_skipped_chapters_are_stated_and_the_book_is_not_called_complete():
+    """跳过一章是"缺页"：要说出缺哪章，而且不能对外宣称"正文完整"。"""
+    report = _report(text_complete=False, chapters_skipped=[
+        {"chapterUid": "3", "title": "第三章", "reason": "empty body"}])
+    notice = app.describe_omissions(report)
+    assert "第三章" in notice, notice
+    assert "正文完整" not in notice, notice
+    one_line = app.describe_omissions(report, compact=True)
+    assert "正文完整" not in one_line, one_line
+    assert "1 章正文缺失" in one_line, one_line
+
+
+@test
 def test_dropped_images_are_stated_with_their_count():
     notice = app.describe_omissions(
         _report(images_dropped=100, chapters_with_dropped_images=66))

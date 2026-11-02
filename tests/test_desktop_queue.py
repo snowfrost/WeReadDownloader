@@ -392,7 +392,12 @@ def test_a_queue_does_not_stall_on_the_omission_dialog():
 
 
 def test_a_failed_queue_book_is_reported_not_called_all_done():
-    """队列里有书没完成时，结束语必须说出来，不能显示"全部完成"。"""
+    """队列里有书没完成时，结束语必须说出来，不能显示"全部完成"。
+
+    2026-10-28 起失败的书会在队列尾部自动补跑一轮（每本一次），所以
+    断言分两段：第一次失败先看见「自动补跑」开始；补跑仍失败才收尾，
+    且结束语必须报「未完成」而不是「全部完成」。
+    """
     root, instance = _make_gui()
     calls = []
     original = _mock_dialogs(instance)
@@ -404,6 +409,19 @@ def test_a_failed_queue_book_is_reported_not_called_all_done():
         instance._start_queue()
         instance._spawn_pending = True
 
+        # 第一轮：失败 → 自动补跑开始，不是收尾。
+        instance.last_failure = True
+        instance.last_failure_status = "下载没有完成"
+        instance.events.put(("done", (instance.job_seq, 1)))
+        instance._drain_events()
+
+        text = instance.status.get()
+        assert "自动补跑" in text, text
+        assert str(instance._queue_book.get("bookId")) == "111", (
+            "补跑的书应当还是失败的那本")
+        assert instance.queue_running, "补跑期间队列应当仍在运行"
+
+        # 第二轮（补跑）：仍失败 → 收尾，结束语报未完成。
         instance.last_failure = True
         instance.last_failure_status = "下载没有完成"
         instance.events.put(("done", (instance.job_seq, 1)))
@@ -412,6 +430,7 @@ def test_a_failed_queue_book_is_reported_not_called_all_done():
         text = instance.status.get()
         assert "全部完成" not in text, text
         assert ("未完成" in text) or ("没完成" in text), text
+        assert not instance.queue_running, "补跑过一轮后队列应当结束"
     finally:
         root.destroy()
         app.messagebox.askyesno, app.messagebox.showinfo = original
@@ -505,11 +524,24 @@ def test_incomplete_queue_result_never_reports_success(code, failed, unresolved)
         instance.last_failure = failed
         instance.last_unresolved = unresolved
         instance._handle_done(instance.job_seq, code)
+        # 2026-10-28 起失败的书自动补跑一轮：第一轮结果照记，
+        # 但队列不结束，补跑同一本。
         assert len(instance.queue_results) == 1
         assert instance.queue_results[0][1] is False
         assert instance.queue_results[0][2]
-        assert "0 本成功，1 本未完成" in instance.status.get()
+        assert instance.queue_running is True
+        # 补跑仍失败 → 收尾，结束语报未完成。
+        instance.last_failure = failed
+        instance.last_unresolved = unresolved
+        instance._handle_done(instance.job_seq, code)
+        assert len(instance.queue_results) == 2
+        assert instance.queue_results[1][1] is False
+        text = instance.status.get()
+        assert "未完成" in text, text
         assert instance.queue_running is False
+        # 2026-10-28 (3)：失败的书放回队列，用户可通过「队列」单独重试。
+        assert [str(b.get("bookId") or "") for b in instance.download_queue] == ["111"], (
+            "失败的书应放回队列供单独重试：%r" % (instance.download_queue,))
     finally:
         app.messagebox.askyesno, app.messagebox.showinfo = original
         root.destroy()

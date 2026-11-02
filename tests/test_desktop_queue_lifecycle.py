@@ -144,3 +144,46 @@ def test_pause_message_survives_the_pending_detail_reload():
     finally:
         app.messagebox.askyesno, app.messagebox.showinfo = original
         root.destroy()
+
+
+def test_queue_dialog_shows_the_running_book_even_when_nothing_waits():
+    """最后一本正在下载时，队列不能显示"队列是空的"。
+
+    当前书在 _start_queue 时已从 download_queue 弹出；旧弹窗只渲染等待列表，
+    于是运行中点顶栏「队列」看到的是一句"队列是空的"。
+    """
+    root, instance = _make_gui()
+    original = _mock_dialogs(instance)
+    try:
+        instance.download_queue = []
+        instance.queue_running = True
+        instance.queue_paused = False
+        instance._queue_book = {"bookId": "111", "title": "正在下的那本书",
+                                "author": ""}
+        instance.progress.set(0.42)
+        instance._show_queue()
+        root.update()
+
+        texts = []
+
+        def collect(widget):
+            for child in widget.winfo_children():
+                try:
+                    value = child.cget("text")
+                    if isinstance(value, str) and value:
+                        texts.append(value)
+                except Exception:
+                    pass
+                collect(child)
+
+        collect(root)
+        joined = "\n".join(texts)
+        assert "正在下载" in joined, joined[:400]
+        assert "正在下的那本书" in joined, joined[:400]
+        assert "42%" in joined, joined[:400]
+        assert "队列是空的" not in joined, joined[:400]
+        assert instance.queue_button.cget("text").startswith("队列 1 本"), (
+            instance.queue_button.cget("text"))
+    finally:
+        app.messagebox.askyesno, app.messagebox.showinfo = original
+        root.destroy()

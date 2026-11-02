@@ -299,12 +299,41 @@ class _ServiceClient:
                 except Exception:
                     pass
 
+    def terminate(self):
+        """Kill the warm worker without waiting for the request lock.
+
+        Closing the window used to call shutdown(), which takes the same lock a
+        request holds while it sits in readline() -- so a search in flight made
+        the close button freeze until the request returned. Closing does not
+        need a graceful quit; it needs the handle detached and the process
+        gone, and any request thread will simply see EOF.
+        """
+        process, self._process = self._process, None
+        if process is None:
+            return
+        try:
+            process.kill()
+        except Exception:
+            pass
+
 # Type scale. The console voice is the OS UI sans at every size -- the old
 # serif display face was part of the editorial look and is gone with it.
 SANS = "Microsoft YaHei UI"
 MONO = "Cascadia Mono"
 
 MAX_EVENTS_PER_TICK = 200
+# Wall-clock budget for one drain pass. The old loop only capped the event
+# COUNT, so 200 cover events could each build a Tk image and block for far
+# longer than the 100 ms tick; 25 ms keeps a normal burst intact while cutting
+# off the expensive tail. The count cap still bounds one pass.
+EVENT_TICK_BUDGET_S = 0.025
+
+# Covers: one request per URL, bounded concurrency, bounded caches. Before
+# this, every re-render started a fresh thread per card and a 200-book shelf
+# produced a thread storm that showed up as scroll lag.
+COVER_MAX_BYTES = 8 * 1024 * 1024
+COVER_CACHE_LIMIT = 256
+COVER_TIMEOUT = (5, 15)
 
 # Log a stall marker when the main thread is blocked this long, so a real
 # session produces the evidence instead of a reconstruction. Windows shows
@@ -323,12 +352,76 @@ RESUME_MIN_MS = 2000.0
 # Result cards per page. Repainting a CTkScrollableFrame costs roughly 80 ms per
 # child widget on the main thread, so keeping a page small is what stops a long
 # result list from freezing the window.
-RESULTS_PER_PAGE = 6
+RESULTS_PER_PAGE = 15
+
+
+def _throttled_scrollbar_sync(bar, delay_ms: int = 16,
+                             settling=None, settle_ms: int = 260):
+    """Return a yscrollcommand that coalesces scrollbar redraws.
+
+    CTkScrollbar.set() redraws its own canvas and calls update_idletasks();
+    measured ~70-120 ms per call here. Tk fires yscrollcommand for every
+    Configure, so a single maximize used to redraw several bars dozens of times
+    and each redraw forced a full pending layout.
+
+    During a window resize (`settling()` true) the update is postponed until
+    the resize has been quiet for `settle_ms`. Normal scrolling only waits
+    `delay_ms`, and repeated events restart the timer so one update happens
+    when the input pauses.
+    """
+    state = {"last": None, "pending": None, "after": None}
+
+    def flush():
+        state["after"] = None
+        fraction = state["pending"]
+        if fraction is None or fraction == state["last"]:
+            return
+        state["last"] = fraction
+        try:
+            bar.set(*fraction)
+        except Exception:
+            pass
+
+    def sync(first, last):
+        fraction = (first, last)
+        if fraction == state["last"]:
+            return
+        state["pending"] = fraction
+        delay = settle_ms if (settling is not None and settling()) else delay_ms
+        if state["after"] is not None:
+            try:
+                bar.after_cancel(state["after"])
+            except Exception:
+                pass
+            state["after"] = None
+        try:
+            state["after"] = bar.after(delay, flush)
+        except Exception:
+            flush()
+
+    return sync
 
 
 def _font(size: int, weight: str = "normal", family: str = SANS) -> ctk.CTkFont:
     """The single place a font is created, so the type scale stays coherent."""
     return ctk.CTkFont(family=family, size=size, weight=weight)
+
+
+def _font_cached(cache: dict, size: int, weight: str = "normal",
+                 family: str = SANS) -> ctk.CTkFont:
+    """Per-canvas font cache.
+
+    Canvas rows used to call _font() for every draw: 12 shelf rows x several
+    fonts meant dozens of new CTkFont objects per resize, and font creation is
+    one of the more expensive Tk calls. The cache is per widget instance so it
+    dies with the widget instead of outliving a destroyed test root.
+    """
+    key = (size, weight, family)
+    font = cache.get(key)
+    if font is None:
+        font = _font(size, weight, family)
+        cache[key] = font
+    return font
 
 
 def _decode_cover(payload: bytes, box: tuple):
@@ -381,6 +474,19 @@ def describe_omissions(report, compact: bool = False) -> str:
     if not isinstance(report, dict):
         return ""
     paragraphs, shorts = [], []
+    # 缺章排在第一位：这是唯一影响"能不能读"的损失，插图/划线都是附加物。
+    skipped = [item for item in (report.get("chapters_skipped") or [])
+               if isinstance(item, dict)]
+    if skipped:
+        names = [str(item.get("title") or item.get("chapterUid") or "")
+                 for item in skipped]
+        shown = "、".join(name for name in names[:4] if name)
+        if len(names) > 4:
+            shown += " 等"
+        paragraphs.append("%d 章正文没能取到（%s）。书里这些位置各留了一页说明，"
+                          "其余章节照常可读；重新下载这本书会再试这几章。"
+                          % (len(skipped), shown or "章节 UID 见技术日志"))
+        shorts.append("%d 章正文缺失" % len(skipped))
     images = int(report.get("images_dropped") or 0)
     markers = report.get("images_dropped_note_markers")
     if markers is None:
@@ -430,12 +536,15 @@ def describe_omissions(report, compact: bool = False) -> str:
     if compact:
         # One line, no embedded newlines, so the status label cannot grow the
         # packed column and push the buttons out of the window.
-        return "书已下载成功（正文完整）：%s。成品见「打开下载目录」。" % "；".join(shorts)
+        head = "书已下载成功（有章节缺失）" if skipped else "书已下载成功（正文完整）"
+        return "%s：%s。成品见「打开下载目录」。" % (head, "；".join(shorts))
     break_line = chr(10)
+    tail = ("这些章节在书里各留了一页说明，其余正文没有受影响。"
+            if skipped else "正文没有受影响。")
     return ("书已下载成功，EPUB 可直接阅读。" + break_line * 2
             + break_line.join(paragraphs)
             + break_line * 2
-            + "正文没有受影响。成品位置：点下方「打开下载目录」。")
+            + tail + "成品位置：点下方「打开下载目录」。")
 
 
 def _tidy_reason(reason) -> str:
@@ -481,7 +590,7 @@ class _Scroller(ctk.CTkFrame):
             if isinstance(color, str) and color not in ("", "transparent"):
                 return color
             widget = getattr(widget, "master", None)
-        return "#FFFFFF"
+        return "#0B1322"
 
     def __init__(self, parent, scrollbar_button_color=None,
                  scrollbar_button_hover_color=None, **kwargs):
@@ -608,7 +717,7 @@ class _ResultCanvas(ctk.CTkFrame):
     background, accent bar, cover, four text lines, checkbox.
     """
 
-    ROW_HEIGHT = 150
+    ROW_HEIGHT = 64
 
     def __init__(self, parent, app):
         super().__init__(parent, fg_color=app.CARD, corner_radius=0)
@@ -621,13 +730,19 @@ class _ResultCanvas(ctk.CTkFrame):
             fg_color="transparent", button_color=app.HAIRLINE,
             button_hover_color=app.ACCENT_TINT)
         self._bar.pack(side="right", fill="y", padx=(2, 0))
-        self.canvas.configure(yscrollcommand=self._bar.set)
+        self.canvas.configure(yscrollcommand=_throttled_scrollbar_sync(
+            self._bar,
+            settling=lambda: time.monotonic() - self._last_resize_at < 0.35))
         self.rows: list[dict] = []
         self.items: dict[str, dict] = {}
         self._photos: dict[str, object] = {}
         self._bid_by_item: dict[int, str] = {}
         self._focus_index = 0
-        self.canvas.bind("<Configure>", lambda _e: self.redraw())
+        self._fonts = {}
+        self._resize_after = None
+        self._last_draw_size = None
+        self._last_resize_at = 0.0
+        self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         for key in ("Up", "Down", "Home", "End", "space", "Return"):
@@ -648,6 +763,32 @@ class _ResultCanvas(ctk.CTkFrame):
         return len(self.rows)
 
     # -- drawing ---------------------------------------------------------
+    def _on_resize(self, event):
+        """Debounce resize redraws.
+
+        最大化/还原会连续发很多 Configure，旧代码每一发都把整表删掉重画，
+        视觉上就是"窗口在重新排布"。拖拽过程中只记尺寸，停 90ms 后画一次。
+        """
+        self._last_resize_at = time.monotonic()
+        size = (event.width, event.height)
+        if size == self._last_draw_size:
+            return
+        if self._resize_after is not None:
+            try:
+                self.after_cancel(self._resize_after)
+            except Exception:
+                pass
+        self._resize_after = self.after(90, self._redraw_after_resize)
+
+    def _redraw_after_resize(self):
+        self._resize_after = None
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        self.redraw()
+
     def rows_changed(self, rows):
         self.rows = list(rows)
         self._focus_index = next((i for i, row in enumerate(self.rows)
@@ -656,6 +797,7 @@ class _ResultCanvas(ctk.CTkFrame):
 
     def redraw(self):
         canvas = self.canvas
+        self._last_draw_size = (canvas.winfo_width(), canvas.winfo_height())
         top = canvas.yview()[0] if self.rows else 0.0
         canvas.delete("all")
         self.items.clear()
@@ -668,6 +810,12 @@ class _ResultCanvas(ctk.CTkFrame):
             canvas.yview_moveto(top)
 
     def _draw_row(self, index, row, width):
+        """紧凑单行：封面 + 书名/作者两行 + 行尾勾选框。
+
+        2026-10-28 精简：原来一行里挤了书名/作者/分类/评分/勾选五层信息，
+        行高 150，一屏只能看两三本。分类与评分详情区都有，行里只留
+        封面、书名、作者（用户拍板），勾选框学书架放到行尾。
+        """
         app = self.app
         canvas = self.canvas
         bid = str(row.get("bookId") or "")
@@ -682,53 +830,35 @@ class _ResultCanvas(ctk.CTkFrame):
         bar = canvas.create_rectangle(0, y, 3, y + h, outline="",
                                       fill=app.ACCENT if selected else app.CARD,
                                       tags=(tag,))
-        cover_x, cover_y, cover_w, cover_h = 12, y + 14, self.app.COVER_W // 2, self.app.COVER_H // 2
+        cover_x, cover_y, cover_w, cover_h = 10, y + 8, 27, 38
         cover_bg = canvas.create_rectangle(cover_x, cover_y, cover_x + cover_w,
                                            cover_y + cover_h, fill=app.SUNKEN,
                                            outline="", tags=(tag,))
         cover_text = canvas.create_text(cover_x + cover_w // 2, cover_y + cover_h // 2,
-                                        text="暂无封面" if bid in self._photos else "封面",
-                                        fill=app.FAINT, font=_font(10), tags=(tag,))
-        text_x = cover_x + cover_w + 14
-        wrap = max(120, width - text_x - 16)
-        title = canvas.create_text(text_x, y + 10, text=str(row.get("title") or "未命名书籍"),
-                                   anchor="nw", width=wrap, font=_font(13, "bold"),
+                                        text="封面", fill=app.FAINT, font=_font_cached(self._fonts, 9), tags=(tag,))
+        text_x = cover_x + cover_w + 10
+        wrap = max(120, width - text_x - 60)
+        title = canvas.create_text(text_x, y + 9, text=str(row.get("title") or "未命名书籍"),
+                                   anchor="nw", width=wrap, font=_font_cached(self._fonts, 12, "bold"),
                                    fill=app.INK, tags=(tag,))
-        author = canvas.create_text(text_x, y + 44, text=str(row.get("author") or "作者未知"),
-                                    anchor="nw", font=_font(11), fill=app.MUTED, tags=(tag,))
-        category = str(row.get("category") or "").strip()
-        if not category:
-            category = "暂无信息" if app.search_done else "分类加载中…"
-        cat = canvas.create_text(text_x, y + 66, text="分类：%s" % category, anchor="nw",
-                                 font=_font(11), fill=app.FAINT, tags=(tag,))
-        raw_rating = row.get("newRating")
-        try:
-            rated = raw_rating not in (None, "") and float(raw_rating) > 0
-        except (TypeError, ValueError):
-            rated = False
-        rating = canvas.create_text(text_x, y + 90,
-                                    text=card_rating_text(raw_rating, row.get("newRatingCount")),
-                                    anchor="nw", font=_font(11),
-                                    fill=app.AMBER if rated else app.FAINT, tags=(tag,))
+        author = canvas.create_text(text_x, y + 34, text=str(row.get("author") or "作者未知"),
+                                    anchor="nw", font=_font_cached(self._fonts, 11), fill=app.MUTED, tags=(tag,))
         check_var = app._card_checks.get(bid)
         checked = bool(check_var.get()) if check_var is not None else False
-        box_x, box_y = text_x, y + 116
-        box = canvas.create_rectangle(box_x, box_y, box_x + 16, box_y + 16, width=2,
+        cx0, cy0 = width - 34, y + (h - 16) // 2
+        box = canvas.create_rectangle(cx0, cy0, cx0 + 16, cy0 + 16, width=2,
                                       outline=app.ACCENT if checked else app.MUTED,
                                       fill=app.ACCENT if checked else app.CARD,
                                       tags=(tag, check_tag))
         if checked:
-            canvas.create_line(box_x + 3, box_y + 8, box_x + 7, box_y + 12,
-                               box_x + 13, box_y + 4, fill="#FFFFFF", width=2,
-                               tags=(tag, check_tag))
-        canvas.create_text(box_x + 24, box_y + 8, text="加入队列", anchor="w",
-                           fill=app.MUTED, font=_font(10), tags=(tag, check_tag))
+            canvas.create_line(cx0 + 3, cy0 + 8, cx0 + 7, cy0 + 12, cx0 + 13, cy0 + 4,
+                               fill=app.ON_ACCENT, width=2, tags=(tag, check_tag))
         canvas.create_line(0, y + h - 1, width, y + h - 1, fill=app.HAIRLINE,
                            tags=(tag,))
         self.items[bid] = {"bg": bg, "bar": bar, "cover_bg": cover_bg,
-                           "cover_text": cover_text, "category": cat, "title": title,
-                           "rating": rating, "check": box}
-        for item in (bg, bar, cover_bg, cover_text, title, author, cat, rating, box):
+                           "cover_text": cover_text, "category": None, "title": title,
+                           "rating": None, "author": author, "check": box}
+        for item in (bg, bar, cover_bg, cover_text, title, author, box):
             self._bid_by_item[item] = bid
         if bid in self._photos:
             self.set_cover(bid, self._photos[bid])
@@ -751,7 +881,8 @@ class _ResultCanvas(ctk.CTkFrame):
         box = entry.get("check")
         if box is not None:
             x0, y0, x1, y1 = self.canvas.coords(box)
-            if x0 - 4 <= x <= x0 + 80 and y0 - 6 <= y <= y1 + 6:
+            # 勾选框在行尾，判定区域给到框四周 8px；行内其他点击仍是选书。
+            if x0 - 8 <= x <= x1 + 8 and y0 - 8 <= y <= y1 + 8:
                 self._toggle_check(bid)
                 return
         self.app._select_book(dict(row))
@@ -834,7 +965,7 @@ class _ResultCanvas(ctk.CTkFrame):
                 self.canvas.delete(item)
         if checked:
             self.canvas.create_line(x0 + 3, y0 + 8, x0 + 7, y0 + 12, x0 + 13, y0 + 4,
-                                    fill="#FFFFFF", width=2,
+                                    fill=self.app.ON_ACCENT, width=2,
                                     tags=("row:%s" % book_id, "check:%s" % book_id))
 
 
@@ -853,12 +984,18 @@ class _ShelfCanvas(ctk.CTkFrame):
             fg_color="transparent", button_color=app.HAIRLINE,
             button_hover_color=app.ACCENT_TINT)
         self._bar.pack(side="right", fill="y", padx=(2, 4), pady=4)
-        self.canvas.configure(yscrollcommand=self._bar.set)
+        self.canvas.configure(yscrollcommand=_throttled_scrollbar_sync(
+            self._bar,
+            settling=lambda: time.monotonic() - self._last_resize_at < 0.35))
         self.rows: list[dict] = []
         self.items: dict[str, dict] = {}
         self._photos: dict[str, object] = {}
         self._empty = ""
-        self.canvas.bind("<Configure>", lambda _e: self.redraw())
+        self._fonts = {}
+        self._resize_after = None
+        self._last_draw_size = None
+        self._last_resize_at = 0.0
+        self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
 
@@ -868,6 +1005,27 @@ class _ShelfCanvas(ctk.CTkFrame):
 
     def row_count(self):
         return len(self.rows)
+
+    def _on_resize(self, event):
+        self._last_resize_at = time.monotonic()
+        size = (event.width, event.height)
+        if size == self._last_draw_size:
+            return
+        if self._resize_after is not None:
+            try:
+                self.after_cancel(self._resize_after)
+            except Exception:
+                pass
+        self._resize_after = self.after(90, self._redraw_after_resize)
+
+    def _redraw_after_resize(self):
+        self._resize_after = None
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        self.redraw()
 
     def rows_changed(self, rows):
         self.rows = list(rows)
@@ -881,6 +1039,7 @@ class _ShelfCanvas(ctk.CTkFrame):
 
     def redraw(self):
         canvas = self.canvas
+        self._last_draw_size = (canvas.winfo_width(), canvas.winfo_height())
         top = canvas.yview()[0] if self.rows else 0.0
         canvas.delete("all")
         self.items.clear()
@@ -888,7 +1047,7 @@ class _ShelfCanvas(ctk.CTkFrame):
         if not self.rows:
             canvas.create_text(width // 2, max(60, canvas.winfo_height() // 2),
                                text=self._empty, fill=self.app.FAINT,
-                               font=_font(12), justify="center", width=max(200, width - 40))
+                               font=_font_cached(self._fonts, 12), justify="center", width=max(200, width - 40))
             canvas.configure(scrollregion=(0, 0, width, max(1, canvas.winfo_height())))
             return
         for index, book in enumerate(self.rows):
@@ -911,34 +1070,51 @@ class _ShelfCanvas(ctk.CTkFrame):
         cover_bg = canvas.create_rectangle(cover_x, cover_y, cover_x + cw, cover_y + ch,
                                            fill=app.SUNKEN, outline="", tags=(tag,))
         cover_text = canvas.create_text(cover_x + cw // 2, cover_y + ch // 2, text="",
-                                        fill=app.FAINT, font=_font(9), tags=(tag,))
+                                        fill=app.FAINT, font=_font_cached(self._fonts, 9), tags=(tag,))
         text_x = cover_x + cw + 10
-        button_w = 64
+        # 右侧从左到右：勾选框（含"队列"小标）+ 下载按钮，共占约 100px。
+        button_w = 100
         wrap = max(80, x1 - button_w - 24 - text_x)
         title = canvas.create_text(text_x, y0 + 10, text=str(book.get("title") or "未命名书籍"),
-                                   anchor="nw", width=wrap, font=_font(13, "bold"),
+                                   anchor="nw", width=wrap, font=_font_cached(self._fonts, 13, "bold"),
                                    fill=app.INK, tags=(tag,))
         author = str(book.get("author") or "").strip() or "作者未知"
         category = str(book.get("category") or "").strip()
         meta = author + (" · " + category if category else "")
         meta_item = canvas.create_text(text_x, y0 + 32, text=meta, anchor="nw", width=wrap,
-                                       font=_font(11), fill=app.FAINT, tags=(tag,))
+                                       font=_font_cached(self._fonts, 11), fill=app.FAINT, tags=(tag,))
         bx1 = x1 - 12
-        bx0 = bx1 - button_w
+        bx0 = bx1 - 64
         by0, by1 = y0 + 13, y0 + 43
-        canvas.create_rectangle(bx0, by0, bx1, by1, fill=app.ACCENT, outline="",
+        canvas.create_rectangle(bx0, by0, bx1, by1, fill=app.SUNKEN,
+                                outline=app.BORDER, width=1,
                                 tags=(tag, "dl:%s" % bid))
-        canvas.create_text((bx0 + bx1) // 2, (by0 + by1) // 2, text="下载", fill="#FFFFFF",
-                           font=_font(12), tags=(tag, "dl:%s" % bid))
+        canvas.create_text((bx0 + bx1) // 2, (by0 + by1) // 2, text="下载", fill=app.INK,
+                           font=_font_cached(self._fonts, 12), tags=(tag, "dl:%s" % bid))
+        # 勾选框：点它切换"加入队列"的选中态，不触发下载。
+        check_var = app._shelf_checks.get(bid)
+        checked = bool(check_var.get()) if check_var is not None else False
+        cx0, cy0 = bx0 - 30, y0 + 23
+        box = canvas.create_rectangle(cx0, cy0, cx0 + 16, cy0 + 16, width=2,
+                                      outline=app.ACCENT if checked else app.MUTED,
+                                      fill=app.ACCENT if checked else app.CARD,
+                                      tags=(tag, "shelfcheck:%s" % bid))
+        if checked:
+            canvas.create_line(cx0 + 3, cy0 + 8, cx0 + 7, cy0 + 12, cx0 + 13, cy0 + 4,
+                               fill=app.ON_ACCENT, width=2, tags=(tag, "shelfcheck:%s" % bid))
+        canvas.create_text(cx0 - 6, cy0 + 8, text="队列", anchor="e",
+                           fill=app.FAINT, font=_font_cached(self._fonts, 10), tags=(tag,))
         self.items[bid] = {"cover_bg": cover_bg, "cover_text": cover_text,
                            "title": title, "meta": meta_item, "button": (bx0, by0, bx1, by1),
-                           "button_ids": [i for i in canvas.find_withtag("dl:%s" % bid)]}
+                           "button_ids": [i for i in canvas.find_withtag("dl:%s" % bid)],
+                           "check": box}
         # 重绘（resize/maximize）会删掉所有 canvas item；已缓存封面必须在这里补回，
         # 否则书架页一拖窗口封面就全没了（搜索结果列表已在 #68 修过同样的坑）。
         if bid in self._photos:
             self.set_cover(bid, self._photos[bid])
 
     def _on_click(self, event):
+        x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
         index = int(y // self.ROW_HEIGHT)
         if not (0 <= index < len(self.rows)):
@@ -946,8 +1122,43 @@ class _ShelfCanvas(ctk.CTkFrame):
         book = self.rows[index]
         bid = str(book.get("bookId") or "")
         title = str(book.get("title") or "")
+        entry = self.items.get(bid) or {}
+        # 勾选框区域优先：点击切换队列勾选，不触发下载。
+        box = entry.get("check")
+        if box is not None:
+            x0, y0, x1, y1 = self.canvas.coords(box)
+            if x0 - 40 <= x <= x1 + 8 and y0 - 8 <= y <= y1 + 8:
+                self._toggle_check(bid)
+                return
         if bid:
             self.app._download_from_shelf(bid, title)
+
+    def _toggle_check(self, bid):
+        var = self.app._shelf_checks.get(bid)
+        if var is None:
+            var = tk.BooleanVar(value=False)
+            self.app._shelf_checks[bid] = var
+        var.set(not var.get())
+        self.refresh_check(bid)
+        self.app._on_shelf_check(bid)
+
+    def refresh_check(self, book_id):
+        entry = self.items.get(book_id)
+        if entry is None:
+            return
+        check_var = self.app._shelf_checks.get(book_id)
+        checked = bool(check_var.get()) if check_var is not None else False
+        x0, y0, _x1, _y1 = self.canvas.coords(entry["check"])
+        self.canvas.itemconfigure(entry["check"],
+                                  fill=self.app.ACCENT if checked else self.app.CARD,
+                                  outline=self.app.ACCENT if checked else self.app.MUTED)
+        for item in self.canvas.find_withtag("shelfcheck:%s" % book_id):
+            if self.canvas.type(item) == "line":
+                self.canvas.delete(item)
+        if checked:
+            self.canvas.create_line(x0 + 3, y0 + 8, x0 + 7, y0 + 12, x0 + 13, y0 + 4,
+                                    fill=self.app.ON_ACCENT, width=2,
+                                    tags=("shelf:%s" % book_id, "shelfcheck:%s" % book_id))
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
@@ -1070,44 +1281,47 @@ class DesktopApp:
     UI sans at every size.
     """
 
-    # surfaces
-    BG = "#F0F2F5"           # cool grey page ground
-    CARD = "#FFFFFF"         # primary surface
-    SUNKEN = "#F7F8FA"       # nested surface: export panel, intro, inputs
-    HAIRLINE = "#E3E6EA"     # 1px structural rule
-    HAIRLINE_SOFT = "#EEF0F3"
+    # surfaces -- Nocturne: deep ink ground, glass panels are pre-blended
+    # equivalents of white/5..white/12 (CustomTkinter has no real alpha over a
+    # blurred backdrop, so the glass is a fixed dark surface plus a light edge).
+    BG = "#0B1322"           # page ground: deep ink blue
+    CARD = "#131E30"         # primary glass surface
+    SUNKEN = "#0F1826"       # nested surface: inputs, intro, export panel
+    HAIRLINE = "#22314A"     # 1px structural rule
+    BORDER = "#2E405C"       # control border: quiet buttons, inline inputs
+    HAIRLINE_SOFT = "#1A2740"
 
     # ink
-    INK = "#1F2937"          # primary text, near-black
-    MUTED = "#4B5563"        # secondary
-    FAINT = "#8B95A3"        # meta / tertiary
+    INK = "#F2F5FA"          # primary text
+    MUTED = "#ADBACB"        # secondary
+    FAINT = "#74869E"        # meta / tertiary
 
-    # the one accent
-    ACCENT = "#2D6A4F"
-    ACCENT_HOVER = "#256048"
-    ACCENT_TINT = "#EAF3EE"
-    ACCENT_ON_TINT = "#256048"
+    # the one accent: champagne gold, only on primary actions and key numbers
+    ACCENT = "#E4B863"
+    ACCENT_HOVER = "#D9A94F"
+    ACCENT_TINT = "#2B2416"
+    ACCENT_ON_TINT = "#F3DCA8"
+    ON_ACCENT = "#141008"    # text on a filled champagne button
     BLUE = ACCENT            # legacy alias; nothing should reference it now
 
-    # semantic, all desaturated
-    GREEN = "#2D6A4F"
-    GREEN_TINT = "#EAF3EE"
-    RED = "#C0392F"
-    RED_TINT = "#FDEAEC"
-    AMBER = "#B7791F"
-    AMBER_TINT = "#FDF5E6"
+    # semantic, all desaturated for a dark ground
+    GREEN = "#7FD1A3"
+    GREEN_TINT = "#152C21"
+    RED = "#E88B84"
+    RED_TINT = "#3A1E1E"
+    AMBER = "#E0B36A"
+    AMBER_TINT = "#33291A"
 
-    # the dark navigation rail (reference design's sidebar). CustomTkinter only
-    # accepts hex colours, so the reference's rgba(255,255,255,.09) is flattened
-    # onto the rail's own gradient here.
-    SIDE_BG = "#1D2632"
-    SIDE_BG_2 = "#232E3C"
-    SIDE_TXT = "#AEB8C5"
-    SIDE_TXT_HI = "#FFFFFF"
-    SIDE_ACTIVE = "#2A3646"
-    SIDE_HOVER = "#242F3D"
+    # the dark navigation rail. CustomTkinter only accepts hex colours, so the
+    # reference's rgba(255,255,255,.09) is flattened onto the rail here.
+    SIDE_BG = "#070E1A"
+    SIDE_BG_2 = "#0B1524"
+    SIDE_TXT = "#8CA0B8"
+    SIDE_TXT_HI = "#F5F8FC"
+    SIDE_ACTIVE = "#1A2940"
+    SIDE_HOVER = "#111D2F"
 
-    RADIUS = 8
+    RADIUS = 14
     COVER_W, COVER_H = 54, 76
     # Small on purpose: the selected card in the list already shows the cover,
     # and every pixel here goes to the introduction instead.
@@ -1116,6 +1330,7 @@ class DesktopApp:
     def __init__(self, root: ctk.CTk):
         self.root = root
         root.report_callback_exception = self._handle_callback_exception
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.title(APP_TITLE)
         # The window's own icon, so the title bar and the taskbar button show the
         # same art as the file and the shortcut. Without iconphoto() Tk shows its
@@ -1133,8 +1348,8 @@ class DesktopApp:
         # cost -- 201 widgets painted in 876 ms and 1201 in 827 ms -- so no
         # layout change removes it, and hiding it costs a second window. The
         # visible build is the accepted trade.
-        ctk.set_appearance_mode("light")
-        ctk.set_default_color_theme("blue")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
         self.events: queue.Queue[tuple] = queue.Queue()
         # 常驻 worker：只承担 auth/shelf/search/book-info/probe，导出与登录
         # 仍各自起进程。首次请求时启动（约 1 s），之后复用同一个 LuaJIT。
@@ -1173,7 +1388,29 @@ class DesktopApp:
         self._image_refs: list = []
         self.card_widgets: dict[str, dict] = {}
         self.cover_cache: dict[str, bytes | None] = {}
+        # One loader for every cover size: URL-level de-duplication, at most
+        # four concurrent fetches, and per-size caches so a re-render or a
+        # page turn reuses what was already decoded instead of downloading it
+        # again. `_cover_failed` is a real negative cache -- the old code stored
+        # None in cover_cache but only treated non-None as a hit, so a dead URL
+        # was retried on every redraw.
         self.cover_slots = threading.Semaphore(4)
+        self._cover_inflight: set[str] = set()
+        self._cover_waiters: dict[str, list[tuple[str, str, tuple[int, int]]]] = {}
+        self._cover_images: dict[tuple[str, int, int], object] = {}
+        self._cover_failed: set[tuple[str, int, int]] = set()
+        # Search rows arrive one line at a time. Re-rendering the whole page for
+        # each of them was the single biggest source of "the list flickers and
+        # the window lags": 15 rows meant 15 full redraws and up to 120 cover
+        # requests. Batch the redraw into the end of the event tick instead.
+        self._render_after_id = None
+        self._in_event_batch = False
+        # 本机导出行的扫描快照：勾选/取消/全选只读它，不再每次递归扫盘。
+        self._local_rows_snapshot: list[tuple] = []
+        # Every worker process, including one still being spawned off-thread.
+        # Closing the window used to miss that window and leave an orphan.
+        self._live_workers: set = set()
+        self._workers_lock = threading.Lock()
         # Search results are kept in full but only one page is ever built into
         # widgets, so the redraw cost per page stays bounded.
         self.result_rows: list[dict] = []
@@ -1181,6 +1418,15 @@ class DesktopApp:
         # 排队下载（方案A）：勾选框 + 加入队列。bookId -> BooleanVar 记录勾选状态，
         # download_queue 按勾选/加入顺序维护待下载列表（per-book 锁互不冲突，串行即可）。
         self._card_checks: dict[str, tk.BooleanVar] = {}
+        # 书架页的勾选状态独立于搜索结果页：同一本书可能两处都出现，
+        # 共用一个 dict 会让搜索页的勾选悄悄改掉书架页的显示。
+        self._shelf_checks: dict[str, tk.BooleanVar] = {}
+        self._shelf_rows_list: list[dict] = []
+        # 书架页两个页签：微信书架 / 本机导出。以前两者上下叠在一页，
+        # 书架被固定高度压到 3 行、导出列表又占 300px，两边都难看。
+        self._shelf_active_tab = "shelf"
+        # 「本机已导出」的复选状态，key 是导出目录名（目录名在 exports 下唯一）。
+        self._local_checks: dict[str, tk.BooleanVar] = {}
         self.download_queue: list[dict] = []
         self.queue_running: bool = False
         # 队列暂停：_pause_requested 由「暂停下载」置位，_handle_done 看到它就不接
@@ -1195,6 +1441,13 @@ class DesktopApp:
         # 失败要留得住：FAILED 行把友好原因存这里，选书/搜索都不会把它冲掉，
         # 直到用户重试或开始新任务。原实现只写一行状态，下一条输出就覆盖了。
         self.last_failure_status: str | None = None
+        # 自动重试状态：单本下载失败后自动重连一次（_export_auto_retried 记
+        # 已替哪本书重试过，同一本不重复）；队列模式失败的书在队列尾部
+        # 自动补跑一轮（_queue_retried 记已补跑过的，_queue_failed_books
+        # 按序存失败书的完整信息）。
+        self._export_auto_retried: str | None = None
+        self._queue_retried: set[str] = set()
+        self._queue_failed_books: list[dict] = []
         # 「检查更新」在设置页按需创建；更新失败的回调可能先于那个页面存在，
         # 所以先占位，使用处必须判断 None。
         self.check_update_button = None
@@ -1203,6 +1456,13 @@ class DesktopApp:
         # 「分类加载中…」，看起来像永远加载不出来。
         self.search_done: bool = False
         self.status = tk.StringVar(value="准备就绪。第一步：检查登录状态。")
+        # 窗口正在关闭：所有挂控件/挂 after 的回调要立刻让路，否则会在
+        # 销毁后的控件上抛 TclError，把关闭流程拖死。
+        self._closing = False
+        # 状态栏语义着色：成功绿、失败红、进行中主题绿深色、其余灰。
+        # trace 在 status_label 构建前就会触发（__init__ 里也有 set），
+        # 回调里 guard 掉就行。
+        self.status.trace_add("write", self._on_status_changed)
         # Non-zero while a modal dialog owns the main loop, so the stall
         # watchdog can tell a waiting dialog from a wedged thread.
         self._modal_depth = 0
@@ -1404,7 +1664,7 @@ class DesktopApp:
         CTkButton's own command is wired by CustomTkinter to its own canvas,
         which is exactly why the top bar's 刷新 / 搜索 buttons work. So the row
         is one button: the glyph and label live in its text, and the reference's
-        3px green selection bar becomes a 3px left border.
+        selection is a quiet raised surface instead of a bright outline.
         """
         item = ctk.CTkButton(
             parent,
@@ -1417,13 +1677,16 @@ class DesktopApp:
             anchor="w",
             corner_radius=6,
             height=38,
-            border_width=3 if active else 0,
-            border_color=self.ACCENT if active else self.SIDE_BG,
+            border_width=0,
         )
         item.pack(fill="x", pady=1)
         item._nav_active = active
         item._nav_text = text
         item._nav_glyph = glyph
+        # 每次切页都为 5 个导航项新建 CTkFont 会反复触发字体解析和重排；
+        # 两个状态各建一次，切页只换引用。
+        item._nav_font_active = _font(13, "bold")
+        item._nav_font_idle = _font(13)
         return item
 
     def _switch_page(self, page_name: str):
@@ -1432,30 +1695,58 @@ class DesktopApp:
             return
         # Update nav item states. Each row is one CTkButton (see _nav_item), so
         # the selected look is rebuilt by configuring the button itself: fill,
-        # text colour, weight, and a 3px left border as the selection bar.
+        # text colour, weight. A 3px gold outline on every side read as a focus ring, not a selection; the raised surface is enough.
         for name, item in self.nav_items.items():
             is_active = name == page_name
             item._nav_active = is_active
             item.configure(
                 fg_color=self.SIDE_ACTIVE if is_active else "transparent",
                 text_color=self.SIDE_TXT_HI if is_active else self.SIDE_TXT,
-                font=_font(13, "bold" if is_active else "normal"),
-                border_width=3 if is_active else 0,
-                border_color=self.ACCENT if is_active else self.SIDE_BG,
+                font=(item._nav_font_active if is_active
+                      else item._nav_font_idle),
+                border_width=0,
             )
 
-        # Hide current page, show new page
-        if self._current_page in self.pages:
-            self.pages[self._current_page].pack_forget()
+        # 不再 pack_forget 旧页面：页面是叠放的，切换只改最上层。
         self._current_page = page_name
         if page_name == "下载工坊":
-            self.workshop_footer.pack(side="bottom", fill="x", pady=(10, 0))
+            self.workshop_footer.place(relx=0, rely=1, anchor="sw", relwidth=1)
         else:
-            self.workshop_footer.pack_forget()
+            self.workshop_footer.place_forget()
+        # 工坊自己有状态行；其他页面靠这条常驻条把操作结果说出来。
+        bar = getattr(self, "global_status_bar", None)
+        if bar is not None:
+            try:
+                if page_name == "下载工坊":
+                    bar.pack_forget()
+                else:
+                    bar.pack(side="bottom", fill="x", before=self.page_host)
+            except Exception:
+                pass
         if page_name not in self.pages:
             # Build on first visit; the builder registers the page in self.pages.
             self._create_page(page_name)
-        self.pages[page_name].pack(fill="both", expand=True)
+        page = self.pages[page_name]
+        self._mount_page(page)
+
+    def _mount_page(self, page) -> None:
+        """Stack a page over the others and raise it, without re-laying out."""
+        try:
+            # 先把新页摆上去并抬到最上层，再撤掉旧页：反过来会出现"旧页已撤、
+            # 新页未画"的一帧背景，看起来就是闪一下。
+            if page.winfo_manager() != "place":
+                page.place(in_=self.page_stack, x=0, y=0,
+                           relwidth=1, relheight=1)
+            page.lift()
+            for other in self.pages.values():
+                if other is page:
+                    continue
+                try:
+                    other.place_forget()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _scan_exports(self):
         """Every export folder, classified, with its disk cost.
@@ -1480,8 +1771,17 @@ class DesktopApp:
                 if not entry.is_dir():
                     continue
                 try:
-                    total = sum(f.stat().st_size
-                                for f in entry.rglob("*") if f.is_file())
+                    # os.walk is scandir underneath; rglob("*") built a Path
+                    # object per file, which is what made this slow on a book
+                    # with tens of thousands of chapter files.
+                    total = 0
+                    for root_dir, _dirs, files in os.walk(entry):
+                        for filename in files:
+                            try:
+                                total += os.stat(os.path.join(
+                                    root_dir, filename)).st_size
+                            except OSError:
+                                continue
                 except OSError:
                     total = 0
                 mtime = datetime.datetime.fromtimestamp(entry.stat().st_mtime)
@@ -1498,6 +1798,30 @@ class DesktopApp:
         except OSError:
             pass
         return rows
+
+    @staticmethod
+    def _read_log_tail(path: Path, limit: int = 65536) -> str:
+        """Read only the tail of a worker log.
+
+        The history page wants DONE lines, which are written at the end of a
+        run. Reading every desktop-*.log in full meant parsing hundreds of
+        megabytes on the Tk thread to keep 200 rows; the tail is what carries
+        the record.
+        """
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                start = max(0, size - limit)
+                handle.seek(start)
+                data = handle.read()
+        except OSError:
+            return ""
+        text = data.decode("utf-8", errors="replace")
+        if start:
+            # The first line in the window is probably cut in half.
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+        return text
 
     def _read_history(self):
         """DONE lines from every worker log, newest first: (stamp, summary).
@@ -1522,11 +1846,10 @@ class DesktopApp:
             # newest file first, so a book downloaded today outranks one from
             # last week even before the per-line sort below
             logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            for log_path in logs:
-                try:
-                    text = log_path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
+            # 200 rows is the page limit; reading a thousand old logs to fill it
+            # is disk work with no visible payoff.
+            for log_path in logs[:200]:
+                text = self._read_log_tail(log_path)
                 for line in text.splitlines():
                     if not line.startswith("DONE "):
                         continue
@@ -1589,7 +1912,7 @@ class DesktopApp:
             # re-registers the new frame under the same key
             self.pages[page_name].destroy()
             del self.pages[page_name]
-        builder(self.page_host)
+        builder(self.page_stack)
 
     def _page_scaffold(self, host, title: str):
         """Shared chrome for the non-workshop pages: heading + one card.
@@ -1627,53 +1950,109 @@ class DesktopApp:
             old.destroy()
         self._create_page(page_name)
         if page_name in self.pages:
-            self.pages[page_name].pack(fill="both", expand=True)
+            self._mount_page(self.pages[page_name])
 
     def _create_bookshelf_page(self, host):
-        """书架 = 微信里的真书架（可下载）+ 本机已导出（可清理）。
+        """我的书架：微信书架与「本机已导出」各占一个满高页签。
 
-        The shelf half is the honest "我的书架": the account's own books, each
-        clickable straight into a download, exactly like a search result. The
-        export half below it is what this machine holds, with the reclaim and
-        delete tools the disk needed.
+        旧版把两件事上下塞进一张卡：书架被固定高度压成三行多，导出列表又
+        固定 300px，结果上半截挤、下半截空。现在一页只讲一件事，各自占满
+        可用高度，列表内部滚动，不在页面层再套一层滚动。
         """
-        page, card = self._page_scaffold(self.page_host, "我的书架")
+        page = ctk.CTkFrame(host, fg_color=self.BG, corner_radius=0)
+        self.pages["我的书架"] = page
 
-        # ---- half 1: the real WeRead shelf --------------------------------
-        head = ctk.CTkFrame(card, fg_color="transparent")
-        head.pack(fill="x", padx=16, pady=(14, 0))
-        ctk.CTkLabel(head, text="微信书架", text_color=self.INK,
-                     font=_font(13, "bold")).pack(side="left")
-        ctk.CTkLabel(head, text="点书名即可下载，与搜索结果一致",
+        head = ctk.CTkFrame(page, fg_color="transparent")
+        head.pack(fill="x")
+        ctk.CTkLabel(head, text="我的书架", text_color=self.INK,
+                     font=_font(18, "bold")).pack(side="left")
+        ctk.CTkLabel(head, text="微信书架用于挑书下载；本机导出用于清理磁盘",
                      text_color=self.FAINT, font=_font(11)).pack(side="left", padx=(10, 0))
-        self._quiet_button(head, "刷新书架", 84, self.load_shelf).pack(side="right")
+        ctk.CTkFrame(page, height=1, fg_color=self.HAIRLINE).pack(fill="x", pady=(12, 0))
 
-        self.shelf_frame = _ShelfCanvas(card, self)
-        self.shelf_frame.pack(fill="x", padx=14, pady=(10, 0))
-        self.shelf_frame.configure(height=210)
+        # ---- tab bar -----------------------------------------------------
+        tabs = ctk.CTkFrame(page, fg_color="transparent")
+        tabs.pack(fill="x", pady=(12, 0))
+        self._shelf_tab_button = ctk.CTkButton(
+            tabs, text="微信书架", width=108, height=32, corner_radius=10,
+            border_width=1, font=_font(12),
+            command=lambda: self._show_shelf_tab("shelf"))
+        self._shelf_tab_button.pack(side="left")
+        self._exports_tab_button = ctk.CTkButton(
+            tabs, text="本机已导出", width=116, height=32, corner_radius=10,
+            border_width=1, font=_font(12),
+            command=lambda: self._show_shelf_tab("exports"))
+        self._exports_tab_button.pack(side="left", padx=(8, 0))
+
+        self._shelf_tab = ctk.CTkFrame(page, fg_color=self.CARD,
+                                       corner_radius=self.RADIUS,
+                                       border_width=1, border_color=self.BORDER)
+        self._exports_tab = ctk.CTkFrame(page, fg_color=self.CARD,
+                                         corner_radius=self.RADIUS,
+                                         border_width=1, border_color=self.BORDER)
+
+        # ---- tab 1: WeRead shelf ----------------------------------------
+        head1 = ctk.CTkFrame(self._shelf_tab, fg_color="transparent")
+        head1.pack(fill="x", padx=16, pady=(12, 0))
+        self.shelf_count_label = ctk.CTkLabel(
+            head1, text="共 0 本", text_color=self.INK, font=_font(13, "bold"))
+        self.shelf_count_label.pack(side="left")
+        ctk.CTkLabel(head1, text="点书名下载；勾选后可批量加入队列",
+                     text_color=self.FAINT, font=_font(11)).pack(side="left", padx=(10, 0))
+        self._quiet_button(head1, "刷新书架", 84, self.load_shelf).pack(side="right")
+        self.shelf_queue_button = self._quiet_button(head1, "加入队列 0 本", 116,
+                                                      self._enqueue_shelf_checked)
+        self.shelf_queue_button.configure(height=26, state="disabled")
+        self.shelf_queue_button.pack(side="right", padx=(0, 8))
+        self._quiet_button(head1, "全选", 60,
+                           self._toggle_shelf_select_all).pack(side="right")
+
+        self.shelf_frame = _ShelfCanvas(self._shelf_tab, self)
+        # fill + expand: the list gets the whole tab height and scrolls inside.
+        self.shelf_frame.pack(fill="both", expand=True, padx=14, pady=(10, 12))
         self.shelf_frame.show_empty("正在读取微信书架…")
         self.load_shelf()
 
-        # ---- half 2: what this machine already holds ----------------------
+        # ---- tab 2: what this machine holds ------------------------------
+        started = time.perf_counter()
         rows = self._scan_exports()
-        if not rows:
-            return
-        ctk.CTkFrame(card, height=1, fg_color=self.HAIRLINE).pack(
-            fill="x", padx=16, pady=(14, 0))
-        head2 = ctk.CTkFrame(card, fg_color="transparent")
-        head2.pack(fill="x", padx=16, pady=(10, 0))
-        ctk.CTkLabel(head2, text="本机已导出", text_color=self.INK,
-                     font=_font(13, "bold")).pack(side="left")
+        scan_ms = (time.perf_counter() - started) * 1000.0
+        if scan_ms > 80:
+            self._persist_log("[PERF] scan_exports %.0fms folders=%d"
+                              % (scan_ms, len(rows)))
+        self._local_rows_snapshot = list(rows)
+        self._build_exports_tab(rows)
+
+        self._show_shelf_tab(self._shelf_active_tab)
+
+    def _build_exports_tab(self, rows):
+        """本机导出页签：工具栏 + 可回收提示 + 满高列表。"""
+        head2 = ctk.CTkFrame(self._exports_tab, fg_color="transparent")
+        head2.pack(fill="x", padx=16, pady=(12, 0))
+        done = [r for r in rows if r[3] == "done"]
+        self.exports_count_label = ctk.CTkLabel(
+            head2, text="共 %d 项 · 成品 %d 本" % (len(rows), len(done)),
+            text_color=self.INK, font=_font(13, "bold"))
+        self.exports_count_label.pack(side="left")
         ctk.CTkLabel(head2, text="删除会永久移除文件，请谨慎",
                      text_color=self.FAINT, font=_font(11)).pack(side="left", padx=(10, 0))
+        self._quiet_button(head2, "全部删除", 84,
+                           lambda: self._delete_exports(rows)).pack(side="right")
+        self._quiet_button(head2, "清半成品保EPUB", 120,
+                           self._cleanup_halfproducts).pack(side="right", padx=(0, 8))
+        self.local_delete_button = self._quiet_button(head2, "删除选中 0 项", 100,
+                                                       self._delete_selected_local)
+        self.local_delete_button.configure(height=26, state="disabled")
+        self.local_delete_button.pack(side="right", padx=(0, 8))
+        self._quiet_button(head2, "全选", 60,
+                           self._toggle_local_select_all).pack(side="right")
 
-        done = [r for r in rows if r[3] == "done"]
         failed = [r for r in rows if r[3] == "failed"]
         reclaimable = [r for r in rows if r[3] in ("partial", "stale", "failed")]
         reclaim_mb = sum(r[1] for r in reclaimable)
-
         if reclaimable:
-            bar = ctk.CTkFrame(card, fg_color=self.AMBER_TINT, corner_radius=6)
+            bar = ctk.CTkFrame(self._exports_tab, fg_color=self.AMBER_TINT,
+                               corner_radius=8)
             bar.pack(fill="x", padx=14, pady=(10, 0))
             what = []
             if failed:
@@ -1688,18 +2067,49 @@ class DesktopApp:
                                           padx=14, pady=10)
             self._quiet_button(bar, "全部清理", 96,
                                lambda: self._delete_exports(reclaimable)
-                               ).pack(side="right", padx=(0, 14))
+                               ).pack(side="right", padx=(0, 12))
 
-        local = self._scrollable(card, fg_color=self.CARD, corner_radius=0)
+        local = self._scrollable(self._exports_tab, fg_color=self.CARD,
+                                 corner_radius=0)
         local.pack(fill="both", expand=True, padx=8, pady=(8, 10))
+        if not rows:
+            ctk.CTkLabel(local, text="本机还没有导出的书。\n下载完成后会出现在这里。",
+                         text_color=self.FAINT, font=_font(13), justify="center"
+                         ).pack(expand=True, pady=40)
         for name, size_mb, mtime, kind, path in rows:
             self._build_local_row(local, name, size_mb, kind, path)
 
+    def _show_shelf_tab(self, which: str) -> None:
+        """Switch between 微信书架 and 本机导出 without rebuilding either."""
+        self._shelf_active_tab = "exports" if which == "exports" else "shelf"
+        active, inactive = (
+            (self._shelf_tab, self._exports_tab)
+            if self._shelf_active_tab == "shelf"
+            else (self._exports_tab, self._shelf_tab))
+        inactive.pack_forget()
+        active.pack(fill="both", expand=True, pady=(12, 0))
+        for name, button, selected in (
+                ("shelf", self._shelf_tab_button, self._shelf_active_tab == "shelf"),
+                ("exports", self._exports_tab_button, self._shelf_active_tab == "exports")):
+            button.configure(
+                fg_color=self.ACCENT_TINT if selected else self.CARD,
+                text_color=self.ACCENT_ON_TINT if selected else self.MUTED,
+                border_color=self.ACCENT if selected else self.BORDER,
+                hover_color=self.ACCENT_TINT if selected else self.SUNKEN)
+
     def _build_local_row(self, parent, name, size_mb, kind, path):
-        """One row of the on-machine export list (delete / 删想法 / open)."""
+        """One row of the on-machine export list (check / delete / 删想法 / open)."""
         row = ctk.CTkFrame(parent, fg_color="transparent", height=44)
         row.pack(fill="x", pady=1)
         row.pack_propagate(False)
+        # 复选框：勾选即进入「删除选中」的候选集，key 用目录名（exports 下唯一）。
+        var = self._local_checks.get(name)
+        if var is None:
+            var = tk.BooleanVar(value=False)
+            self._local_checks[name] = var
+        ctk.CTkCheckBox(row, text="", width=24, checkbox_width=18, checkbox_height=18,
+                        variable=var, command=lambda n=name: self._on_local_check(n)
+                        ).pack(side="left", padx=(6, 0))
         if kind == "done":
             glyph, tint = "▤", self.GREEN
         elif kind == "failed":
@@ -1735,7 +2145,7 @@ class DesktopApp:
         ctk.CTkButton(row, text="删除", width=48, height=26,
                       corner_radius=6, fg_color=self.CARD,
                       hover_color=self.RED_TINT,
-                      border_width=1, border_color="#D5D9DF",
+                      border_width=1, border_color=self.BORDER,
                       text_color=self.RED, font=_font(11),
                       command=lambda r=(name, size_mb, None, kind, path):
                       self._delete_exports([r])
@@ -1744,13 +2154,13 @@ class DesktopApp:
             ctk.CTkButton(row, text="删想法", width=60, height=26,
                           corner_radius=6, fg_color=self.CARD,
                           hover_color=self.AMBER_TINT,
-                          border_width=1, border_color="#D5D9DF",
+                          border_width=1, border_color=self.BORDER,
                           text_color=self.AMBER, font=_font(11),
                           command=lambda p=path: self._delete_thoughts(p)
                           ).pack(side="right", padx=(0, 4))
         ctk.CTkButton(row, text="打开", width=48, height=26,
                       corner_radius=6, fg_color=self.CARD, hover_color=self.SUNKEN,
-                      border_width=1, border_color="#D5D9DF", text_color=self.MUTED,
+                      border_width=1, border_color=self.BORDER, text_color=self.MUTED,
                       font=_font(11),
                       command=lambda n=name: self._open_export(n)
                       ).pack(side="right")
@@ -1770,17 +2180,39 @@ class DesktopApp:
         self.shelf_frame.show_empty(
             "书架读取失败。请检查登录状态，再点「刷新书架」重试。")
 
+    def _fit_shelf_height(self, count: int) -> None:
+        """给书架一个合理的最小高度；实际高度由页签的 expand 决定。
+
+        旧版把上限压到 560px，一页只装 9 行；现在书架独占一个页签，
+        列表拿满可用高度，行数超了就在列表内部滚动。
+        """
+        frame = getattr(self, "shelf_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+        row_h = getattr(frame, "ROW_HEIGHT", 62)
+        needed = count * row_h + 12
+        frame.configure(height=max(320, min(needed, 760)))
+
     def _show_shelf(self, rows):
         """Render the account's shelf into the shelf frame."""
         if not hasattr(self, "shelf_frame") or not self.shelf_frame.winfo_exists():
             return
+        label = getattr(self, "shelf_count_label", None)
+        if label is not None:
+            try:
+                label.configure(text="共 %d 本" % len(rows or []))
+            except Exception:
+                pass
         if not rows:
             self.shelf_frame.show_empty(
                 "书架是空的，或登录状态已过期。点「刷新书架」重试，或先「检查登录」。")
             return
+        self._shelf_rows_list = list(rows)
         self.shelf_frame.rows_changed(rows)
+        self._fit_shelf_height(len(rows))
         for book in rows:
             self._register_shelf_row(book)
+        self._refresh_shelf_queue_add()
         self.status.set("已读取微信书架，共 %d 本。" % len(rows))
 
     def _register_shelf_row(self, book):
@@ -1791,18 +2223,100 @@ class DesktopApp:
             self._request_shelf_cover(book_id, url)
 
     def _request_shelf_cover(self, book_id, url):
-        """Load a cover in the background; failures leave the placeholder."""
-        def fetch():
-            image = None
-            try:
-                response = requests.get(url, timeout=(5, 15))
-                response.raise_for_status()
-                if len(response.content) <= 8 * 1024 * 1024:
-                    image = _decode_cover(response.content, (36, 48))
-            except Exception:
-                image = None
-            self.events.put(("shelf-cover", (book_id, image)))
-        threading.Thread(target=fetch, daemon=True).start()
+        """Load a shelf cover through the shared loader; failures keep the placeholder."""
+        self._request_cover(url, (36, 48), "shelf", book_id)
+
+    def _selected_shelf_books(self) -> list[dict]:
+        """书架页当前勾选的书（按书架顺序）。"""
+        out = []
+        for book in self._shelf_rows_list:
+            bid = str(book.get("bookId") or "")
+            if bid and self._shelf_checks.get(bid, tk.BooleanVar()).get():
+                out.append(book)
+        return out
+
+    def _refresh_shelf_queue_add(self) -> None:
+        """书架头部「加入队列 N 本」按钮跟着勾选数走，0 本置灰。"""
+        button = getattr(self, "shelf_queue_button", None)
+        if button is None:
+            return
+        count = len(self._selected_shelf_books())
+        button.configure(text="加入队列 %d 本" % count,
+                         state="normal" if count else "disabled")
+
+    def _on_shelf_check(self, book_id: str) -> None:
+        """书架行勾选/取消的即时反馈；入队发生在 _enqueue_shelf_checked。
+
+        取消勾选且队列未开跑时同步出队，与搜索结果页的语义一致；
+        队列运行中只提示，不打断。
+        """
+        title = ""
+        for book in self._shelf_rows_list:
+            if str(book.get("bookId") or "") == book_id:
+                title = str(book.get("title") or "")
+                break
+        title = title or book_id
+        self._refresh_shelf_queue_add()
+        if self._shelf_checks.get(book_id, tk.BooleanVar()).get():
+            self.status.set("已勾选《%s》；勾完后点「加入队列」。" % title)
+            return
+        if not self.queue_running:
+            before = len(self.download_queue)
+            self.download_queue = [b for b in self.download_queue
+                                   if str(b.get("bookId") or "") != book_id]
+            self._refresh_queue_button()
+            if len(self.download_queue) != before:
+                self.status.set("已从队列移除《%s》，队列还剩 %d 本。"
+                                % (title, len(self.download_queue)))
+                return
+        self.status.set("已取消勾选《%s》。" % title)
+
+    def _toggle_shelf_select_all(self) -> None:
+        """全选/全不选切换：全部已勾时点它变全不选，否则全选。"""
+        if not self._shelf_rows_list:
+            self.status.set("书架还是空的，先「刷新书架」。")
+            return
+        all_checked = all(
+            self._shelf_checks.get(str(b.get("bookId") or ""),
+                                   tk.BooleanVar()).get()
+            for b in self._shelf_rows_list if b.get("bookId"))
+        target = not all_checked
+        for book in self._shelf_rows_list:
+            bid = str(book.get("bookId") or "")
+            if not bid:
+                continue
+            var = self._shelf_checks.get(bid)
+            if var is None:
+                var = tk.BooleanVar(value=False)
+                self._shelf_checks[bid] = var
+            var.set(target)
+            self.shelf_frame.refresh_check(bid)
+        self._refresh_shelf_queue_add()
+        self.status.set("已全选 %d 本。" % len(self._shelf_rows_list) if target
+                        else "已取消全选。")
+
+    def _enqueue_shelf_checked(self) -> None:
+        """把书架勾选的书加入 download_queue（已存在的跳过）。"""
+        existing = {str(b.get("bookId") or "") for b in self.download_queue}
+        added = 0
+        for row in self._selected_shelf_books():
+            bid = str(row.get("bookId") or "")
+            if not bid or bid in existing:
+                continue
+            self.download_queue.append({
+                "bookId": bid,
+                "title": str(row.get("title") or ""),
+                "author": str(row.get("author") or ""),
+            })
+            existing.add(bid)
+            added += 1
+        self._refresh_queue_button()
+        self._refresh_shelf_queue_add()
+        if added:
+            self.status.set("已从书架加入队列 %d 本，共 %d 本待下载。点顶栏「队列」查看并开始。"
+                            % (added, len(self.download_queue)))
+        else:
+            self.status.set("没有新增可加入队列的书（可能已加入或没有勾选）。")
 
     def _download_from_shelf(self, book_id, title):
         """Pick a shelf book and go straight to the download confirmation.
@@ -1927,24 +2441,156 @@ class DesktopApp:
             self.status.set("已删除 %d 项，回收约 %.0f MB。"
                             % (len(removed), total_mb))
 
+    def _on_local_check(self, name: str) -> None:
+        """「本机已导出」行勾选变化：刷新「删除选中」按钮的计数与可用态。"""
+        button = getattr(self, "local_delete_button", None)
+        if button is None:
+            return
+        count = len(self._selected_local_rows())
+        button.configure(text="删除选中 %d 项" % count,
+                         state="normal" if count else "disabled")
+
+    def _selected_local_rows(self) -> list[tuple]:
+        """当前勾选的本机导出行（name, size, mtime, kind, path）。
+
+        读页面构建时留下的快照，而不是再扫一次盘。勾一个复选框就递归 stat
+        全部导出目录，是大书上"点一下卡一下"的直接原因。
+        """
+        out = []
+        rows = self._local_rows_snapshot or self._scan_exports()
+        for row in rows:
+            name = row[0]
+            if self._local_checks.get(name, tk.BooleanVar()).get():
+                out.append(row)
+        return out
+
+    def _toggle_local_select_all(self) -> None:
+        """本机导出列表的全选/全不选切换。"""
+        rows = self._local_rows_snapshot or self._scan_exports()
+        if not rows:
+            self.status.set("本机还没有导出的书，无可选择。")
+            return
+        all_checked = all(
+            self._local_checks.get(r[0], tk.BooleanVar()).get() for r in rows)
+        target = not all_checked
+        for r in rows:
+            var = self._local_checks.get(r[0])
+            if var is None:
+                var = tk.BooleanVar(value=False)
+                self._local_checks[r[0]] = var
+            var.set(target)
+        self._on_local_check("")
+        self.status.set("已全选 %d 项。" % len(rows) if target else "已取消全选。")
+
+    def _delete_selected_local(self) -> None:
+        """删除勾选的本机导出（确认与善后复用 _delete_exports）。"""
+        rows = self._selected_local_rows()
+        if not rows:
+            self.status.set("先勾选要删除的条目，再点「删除选中」。")
+            return
+        self._delete_exports(rows)
+
+    def _cleanup_halfproducts(self) -> None:
+        """清除半成品与残留，保留全部已完成书的 EPUB。
+
+        只删 partial（.work 断点目录）、stale（残留）和 failed（从未产出
+        EPUB 的目录）；done（成品）一律不动。.work 是成品的兄弟目录，
+        删它只损失"续传能力"，不碰任何已发布的 EPUB。
+        """
+        rows = self._scan_exports()
+        victims = [r for r in rows if r[3] in ("partial", "stale", "failed")]
+        if not victims:
+            self.status.set("没有半成品或残留可清理。")
+            return
+        reclaim_mb = sum(r[1] for r in victims)
+        done = [r for r in rows if r[3] == "done"]
+        message = ("清除 %d 项半成品/残留，共约 %.0f MB？\n\n"
+                   "已完成的 %d 本书（EPUB）全部保留，不受影响。\n"
+                   "被清除的书如需重下将从零开始，不能续传。\n\n继续吗？"
+                   % (len(victims), reclaim_mb, len(done)))
+        if not self._ask("askyesno", "清除半成品（保留 EPUB）", message):
+            return
+        removed, failed = [], []
+        for name, _size, _mtime, _kind, path in victims:
+            try:
+                shutil.rmtree(str(path))
+                removed.append(name)
+            except Exception as exc:
+                failed.append((name, str(exc)))
+                self._persist_log("[DELETE_FAILED] %s: %s" % (name, exc))
+        if removed:
+            self._persist_log("[CLEANUP_HALF] removed %d folder(s): %s"
+                              % (len(removed), ", ".join(removed)))
+        self._refresh_page("我的书架")
+        if failed:
+            self.status.set("已清除 %d 项，%d 项失败（可能仍被占用），详见技术日志。"
+                            % (len(removed), len(failed)))
+        else:
+            self.status.set("已清除 %d 项半成品，回收约 %.0f MB；EPUB 全部保留。"
+                            % (len(removed), reclaim_mb))
+
     def _create_download_history_page(self, host):
-        """下载记录：the worker log's DONE lines, newest first."""
-        page, card = self._page_scaffold(self.page_host, "下载记录")
+        """下载记录：分页展示 worker 日志里的 DONE 行。
+
+        旧版一次建 200 行、每行 3 个 CTk 控件（约 1400 个 widget）。窗口
+        最大化/还原时 Tk 要把它们全部重新布局，实测一次缩放接近 1 秒。
+        现在每页 40 行，行内用原生 tk.Label（原生控件缩放成本约为 CTk 的
+        1/4），翻页只重建当前页。
+        """
+        page, card = self._page_scaffold(host, "下载记录")
         rows = self._read_history()
         if not rows:
             ctk.CTkLabel(card, text="还没有下载记录。\n\n每次完成的下载会在这里留一条。",
                          text_color=self.FAINT, font=_font(13), justify="center"
                          ).pack(expand=True)
             return
-        list_frame = self._scrollable(card, fg_color=self.CARD, corner_radius=0)
-        list_frame.pack(fill="both", expand=True, padx=12, pady=10)
-        for stamp, line in rows:
-            row = ctk.CTkFrame(list_frame, fg_color="transparent")
-            row.pack(fill="x", pady=2)
-            ctk.CTkLabel(row, text=stamp, text_color=self.GREEN, width=130,
-                         font=_font(11, "normal", MONO), anchor="w").pack(side="left")
-            ctk.CTkLabel(row, text=line, text_color=self.MUTED, anchor="w",
-                         font=_font(12)).pack(side="left", fill="x", expand=True)
+
+        page_size = 40
+        state = {"page": 0}
+        body = ctk.CTkFrame(card, fg_color=self.CARD)
+        body.pack(fill="both", expand=True, padx=12, pady=(10, 4))
+        pager = ctk.CTkFrame(card, fg_color="transparent")
+        pager.pack(fill="x", padx=12, pady=(0, 10))
+        prev_button = self._quiet_button(pager, "上一页", 76,
+                                         lambda: turn(-1))
+        prev_button.pack(side="left")
+        page_label = ctk.CTkLabel(pager, text="", text_color=self.MUTED,
+                                  font=_font(11))
+        page_label.pack(side="left", padx=12)
+        next_button = self._quiet_button(pager, "下一页", 76,
+                                         lambda: turn(1))
+        next_button.pack(side="left")
+
+        def render() -> None:
+            for child in body.winfo_children():
+                child.destroy()
+            start = state["page"] * page_size
+            chunk = rows[start:start + page_size]
+            for stamp, line in chunk:
+                row = tk.Frame(body, bg=self.CARD, highlightthickness=0, bd=0)
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=stamp, fg=self.GREEN, bg=self.CARD, width=14,
+                         anchor="w", font=(MONO, 9)).pack(side="left")
+                tk.Label(row, text=line, fg=self.MUTED, bg=self.CARD, anchor="w",
+                         font=(SANS, 10)).pack(side="left", fill="x", expand=True)
+            pages = max(1, (len(rows) + page_size - 1) // page_size)
+            page_label.configure(text="第 %d / %d 页 · 共 %d 条"
+                                      % (state["page"] + 1, pages, len(rows)))
+            prev_button.configure(state="normal" if state["page"] > 0 else "disabled")
+            next_button.configure(state="normal"
+                                  if state["page"] + 1 < pages else "disabled")
+            if pages <= 1:
+                pager.pack_forget()
+
+        def turn(delta: int) -> None:
+            pages = max(1, (len(rows) + page_size - 1) // page_size)
+            target = min(max(0, state["page"] + delta), pages - 1)
+            if target == state["page"]:
+                return
+            state["page"] = target
+            render()
+
+        render()
 
     def _create_statistics_page(self, host):
         """存储占用：exports 目录占了多少、能回收多少。
@@ -1953,7 +2599,7 @@ class DesktopApp:
         内容给的是空间回收，而且和书架页那条「可回收」横幅是同一件事。改名为它
         实际做的事。
         """
-        page, card = self._page_scaffold(self.page_host, "存储占用")
+        page, card = self._page_scaffold(host, "存储占用")
         rows = self._scan_exports()
         done = [r for r in rows if r[3] == "done"]
         failed = [r for r in rows if r[3] == "failed"]
@@ -2003,7 +2649,7 @@ class DesktopApp:
 
     def _create_settings_page(self, host):
         """设置：real, small, and honest about what each item does."""
-        page, card = self._page_scaffold(self.page_host, "设置")
+        page, card = self._page_scaffold(host, "设置")
 
         def folder_row(label, path, opener):
             row = ctk.CTkFrame(card, fg_color="transparent")
@@ -2095,7 +2741,7 @@ class DesktopApp:
             row.pack(fill="x", padx=24, pady=(0, 16))
             ctk.CTkButton(row, text="确定", width=88, height=32, corner_radius=6,
                           fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
-                          text_color="#FFFFFF", font=_font(12),
+                          text_color=self.ON_ACCENT, font=_font(12),
                           command=dialog.destroy).pack(side="right")
             dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
             dialog.update_idletasks()
@@ -2144,12 +2790,17 @@ class DesktopApp:
                 dialog.destroy()
 
     def _quiet_button(self, parent, text: str, width: int, command, **kwargs):
-        """Secondary action: outlined on the card surface, never a filled slab."""
+        """Secondary action: outlined on the card surface, never a filled slab.
+
+        hover 用主题绿的淡染而不是 SUNKEN：SUNKEN 与卡片底色只差一档灰，
+        实测几乎感知不到，按钮像没反应；ACCENT_TINT 让"可以点"一眼可见，
+        也和主按钮的绿呼应。
+        """
         return ctk.CTkButton(
             parent, text=text, width=width, height=34, command=command,
             corner_radius=self.RADIUS, fg_color=self.CARD,
-            hover_color=self.SUNKEN, text_color=self.MUTED,
-            border_width=1, border_color="#D5D9DF",
+            hover_color=self.ACCENT_TINT, text_color=self.MUTED,
+            border_width=1, border_color=self.BORDER,
             font=_font(13), **kwargs)
 
     def _scrollable(self, parent, **kwargs):
@@ -2171,14 +2822,11 @@ class DesktopApp:
         except Exception:
             pass
         if bar is not None:
-            def _sync_scroll(first, last):
-                bar.set(first, last)
-                try:
-                    canvas.update_idletasks()
-                except Exception:
-                    pass
             try:
-                canvas.configure(yscrollcommand=_sync_scroll)
+                canvas.configure(yscrollcommand=_throttled_scrollbar_sync(
+                    bar,
+                    settling=lambda: (time.monotonic()
+                                      - getattr(self, "_last_resize_at", 0.0) < 0.35)))
             except Exception:
                 pass
         return frame
@@ -2216,7 +2864,7 @@ class DesktopApp:
         # not the artwork in weread-app.ico, so it matched neither the shortcut
         # nor the title bar. One name and one icon, both in the title bar.
 
-        ctk.CTkFrame(side, height=1, fg_color="#2A3646").pack(fill="x", padx=16, pady=(14, 10))
+        ctk.CTkFrame(side, height=1, fg_color=self.HAIRLINE).pack(fill="x", padx=16, pady=(14, 10))
 
         nav = ctk.CTkFrame(side, fg_color="transparent")
         nav.pack(fill="both", expand=True, padx=10)
@@ -2235,7 +2883,7 @@ class DesktopApp:
         # 结果是「设置」这行画在旧位置、可点区域在新位置——实测点文字没反应，得在
         # 文字上方约 30px 才点得到；点中之后这行又自己跳上去。留在 nav 里行高恒定，
         # 绘制位置和命中区域就永远一致。
-        ctk.CTkFrame(nav, height=1, fg_color="#2A3646").pack(fill="x", padx=6, pady=8)
+        ctk.CTkFrame(nav, height=1, fg_color=self.HAIRLINE).pack(fill="x", padx=6, pady=8)
         self.nav_items["设置"] = self._nav_item(nav, "设置", "⚙",
                                                 command=lambda: self._switch_page("设置"))
 
@@ -2250,7 +2898,7 @@ class DesktopApp:
         # it drives the same search() the old panel input did.
         self.search_entry = ctk.CTkEntry(
             topbar, placeholder_text="搜索书名、作者或关键词…", height=34,
-            corner_radius=6, fg_color=self.SUNKEN, border_color="#DDE1E6",
+            corner_radius=6, fg_color=self.SUNKEN, border_color=self.BORDER,
             text_color=self.INK, font=_font(13))
         self.search_entry.pack(side="left", fill="x", expand=True,
                                padx=(24, 8), pady=(0, 0), ipadx=0)
@@ -2258,7 +2906,7 @@ class DesktopApp:
         self.search_button = ctk.CTkButton(
             topbar, text="搜索", width=60, height=34, command=self.search,
             corner_radius=6, fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
-            text_color="#FFFFFF", font=_font(13))
+            text_color=self.ON_ACCENT, font=_font(13))
         self.search_button.pack(side="left", pady=(0, 0))
 
         # 顶栏只留三件事：队列入口、账号、登录状态。原来「加入队列」「开始
@@ -2279,7 +2927,7 @@ class DesktopApp:
         self.auth_badge = ctk.CTkButton(
             topbar, text="尚未检查", width=92, height=32,
             corner_radius=6, fg_color=self.SUNKEN, hover_color=self.ACCENT_TINT,
-            border_width=1, border_color="#D5D9DF",
+            border_width=1, border_color=self.BORDER,
             text_color=self.MUTED, font=_font(12), command=self.check_auth)
         self.auth_badge.pack(side="right", padx=(0, 24))
 
@@ -2289,6 +2937,16 @@ class DesktopApp:
         # the other five are created on demand by _create_page().
         self.pages = {}
         self._current_page = "下载工坊"
+
+        # 全局状态条：书架入队、删除、清理这些动作的反馈原来只写在工坊底部，
+        # 用户切到别的页就看不见。这条只在非工坊页面出现，工坊自己有更详细的
+        # 状态行，避免同一句话在屏幕上出现两遍。
+        self.global_status_bar = ctk.CTkFrame(
+            main, height=26, fg_color=self.SUNKEN, corner_radius=0)
+        self.global_status_label = ctk.CTkLabel(
+            self.global_status_bar, textvariable=self.status, text_color=self.MUTED,
+            height=1, font=_font(11), anchor="w")
+        self.global_status_label.pack(fill="x", padx=24)
 
         self.page_host = ctk.CTkFrame(main, fg_color=self.BG, corner_radius=0)
         self.page_host.pack(fill="both", expand=True, padx=24, pady=(10, 10))
@@ -2302,18 +2960,29 @@ class DesktopApp:
         # ③ 下载面板固定在底部，不跟内容一起滚：它是操作区，任何窗口高度下
         # 都必须可见。以前它和卡片一起放在滚动区里，靠"算卡片区高度"来腾地方，
         # 算错一次（窗口刚建、DPI 变化）底部按钮就被裁掉。
-        footer = ctk.CTkFrame(self.page_host, fg_color=self.BG, corner_radius=0)
-        footer.pack(side="bottom", fill="x", pady=(10, 0))
-        self.workshop_footer = footer
+        # 所有页面都叠在这个容器里，用 lift() 切换。以前用 pack_forget/pack
+        # 显示页面：每切一次都让 Tk 重新计算整页几何，视觉上就是整屏闪一下、
+        # 最大化/还原时尤其明显。叠放后切换只是把一张已经排好的页面提到最上层。
+        self.page_stack = ctk.CTkFrame(self.page_host, fg_color=self.BG,
+                                       corner_radius=0)
+        self.page_stack.place(x=0, y=0, relwidth=1, relheight=1)
         page_scroll = self._scrollable(
-            self.page_host, fg_color=self.BG, corner_radius=0,
+            self.page_stack, fg_color=self.BG, corner_radius=0,
             scrollbar_button_color=self.HAIRLINE,
             scrollbar_button_hover_color=self.ACCENT_TINT)
-        page_scroll.pack(fill="both", expand=True)
+        page_scroll.place(x=0, y=0, relwidth=1, relheight=1)
         self.page_scroll = page_scroll
         page = ctk.CTkFrame(page_scroll, fg_color=self.BG, corner_radius=0)
         page.pack(fill="x", expand=True)
         self.pages["下载工坊"] = page_scroll
+
+        # ③ 下载面板叠在页面之上，而不是 pack 在页面下面。pack 收起/展开会把
+        # page_stack 的高度从"整屏"改成"整屏减面板"，每次切页都让所有页面重新
+        # 排布一遍——这正是"切页像在重新排布窗口"的来源。叠放后页面尺寸恒定，
+        # 面板只是盖住底部；_fit_body_to_window 会把它的高度从可用区里扣掉。
+        footer = ctk.CTkFrame(self.page_host, fg_color=self.BG, corner_radius=0)
+        footer.place(relx=0, rely=1, anchor="sw", relwidth=1)
+        self.workshop_footer = footer
 
         head_row = ctk.CTkFrame(page, fg_color="transparent")
         head_row.pack(fill="x")
@@ -2354,6 +3023,11 @@ class DesktopApp:
         # 绑在 scrolling frame 上会形成「改高度 -> 重排 -> 又触发 Configure」
         # 的循环，实测直接把解释器打崩（Segmentation fault）。
         def _fit_body_to_window(_event=None):
+            self._fit_after_id = None
+            # 工坊看不见时不要动它的 body：否则在其他页最大化/还原时，
+            # 隐藏页面照样重排一次 CTkScrollableFrame，等于把缩放成本翻倍。
+            if self._current_page != "下载工坊":
+                return
             head = getattr(self, "workshop_head", None)
             panel = getattr(self, "export_panel", None)
             if head is None or panel is None or getattr(self, "_fitting", False):
@@ -2377,16 +3051,36 @@ class DesktopApp:
                 scale = ctk.ScalingTracker.get_window_dpi_scaling(self.root) or 1.0
             except Exception:
                 scale = 1.0
-            # ③ 面板已经在滚动区之外，这里只需扣掉标题行和间距。
-            available = (viewport - head.winfo_height() - 24) / scale
+            # ③ 面板现在叠在页面底部，页面本身仍是整屏高：算 body 高度时必须
+            # 把它盖住的那一截扣掉，否则最后几行会被面板压住。
+            footer = getattr(self, "workshop_footer", None)
+            reserved = 0
+            if footer is not None and footer.winfo_ismapped():
+                try:
+                    reserved = max(footer.winfo_height(),
+                                   panel.winfo_reqheight()) + 10
+                except Exception:
+                    reserved = 0
+            available = (viewport - head.winfo_height() - reserved - 24) / scale
             target = int(max(340, available))
             try:
                 current = int(self.body.cget("height"))
             except (TypeError, ValueError):
                 current = 0
+            canvas_for_scroll = getattr(self.page_scroll, "_parent_canvas", None)
+            at_bottom = False
+            if canvas_for_scroll is not None:
+                try:
+                    at_bottom = canvas_for_scroll.yview()[1] >= 0.999
+                except Exception:
+                    at_bottom = False
             try:
                 if abs(current - target) > 8:
                     self.body.configure(height=target)
+                    # 高度变化会改 scrollregion；用户本来贴在底部时不要被弹开。
+                    if at_bottom and canvas_for_scroll is not None:
+                        self.root.update_idletasks()
+                        canvas_for_scroll.yview_moveto(1.0)
                 # 状态行会写整段缺失说明（「152 张插图…2537 条划线…」），
                 # 没有 wraplength 时标签的请求宽度等于整行文字，会把 ③ 面板
                 # 撑出窗口，右侧按钮被推出去。按窗口宽度换行。
@@ -2398,14 +3092,31 @@ class DesktopApp:
             finally:
                 self._fitting = False
 
-        def _on_root_configure(event):
-            if event.widget is self.root:
-                _fit_body_to_window()
-        self.root.bind("<Configure>", _on_root_configure)
-        # 可视区大小变化（窗口缩放、滚动条出现/消失）也重算一次。
+        self._fit_after_id = None
+        self._last_resize_at = 0.0
+
+        def _schedule_fit(event=None):
+            """Debounce the height recalculation.
+
+            最大化/还原会连续发十几个 Configure；每一个都改 body 高度，就会
+            触发连锁重排，看起来像窗口在自己重新排布。合并成一次。
+            """
+            if event is not None and event.widget is not self.root:
+                # 只认 root 的尺寸变化；子控件 Configure 多到会打满定时器。
+                return
+            self._last_resize_at = time.monotonic()
+            if self._fit_after_id is not None:
+                try:
+                    self.root.after_cancel(self._fit_after_id)
+                except Exception:
+                    pass
+            self._fit_after_id = self.root.after(70, _fit_body_to_window)
+
+        self.root.bind("<Configure>", _schedule_fit)
+        # 可视区大小变化（滚动条出现/消失）也重算一次，但同样延后。
         canvas = getattr(self.page_scroll, "_parent_canvas", None)
         if canvas is not None:
-            canvas.bind("<Configure>", _fit_body_to_window, add="+")
+            canvas.bind("<Configure>", lambda _e: _schedule_fit(None), add="+")
 
         left = ctk.CTkFrame(self.body, fg_color=self.CARD, corner_radius=self.RADIUS,
                             border_width=1, border_color=self.HAIRLINE, width=380)
@@ -2532,7 +3243,7 @@ class DesktopApp:
         self.export_panel = export
         # ③ 面板的高度在运行中会变（状态文字换行、按钮行出现），只在窗口
         # Configure 时算一次，面板一变高就把底部按钮挤出可视区。
-        export.bind("<Configure>", _fit_body_to_window)
+        export.bind("<Configure>", lambda _e: _schedule_fit(None))
         export.grid_columnconfigure(0, weight=0)
         self._section(export, "③", "下载到电脑",
                       grid_at={"row": 0, "column": 0, "columnspan": 1, "sticky": "w",
@@ -2559,7 +3270,7 @@ class DesktopApp:
             # 与原来「并发」框同一套质感：圆角、卡片底色、下拉列表也用卡片色，
             # 按钮区沿用顶栏的细线色。不设 border_width——CTkComboBox 默认无边框，
             # 加了反而比原来的并发框多一圈描边。
-            corner_radius=6, fg_color=self.CARD, border_color="#D5D9DF",
+            corner_radius=6, fg_color=self.CARD, border_color=self.BORDER,
             text_color=self.INK, font=_font(12), dropdown_font=_font(12),
             dropdown_fg_color=self.CARD, dropdown_text_color=self.INK,
             button_color=self.HAIRLINE, button_hover_color=self.SUNKEN)
@@ -2577,13 +3288,13 @@ class DesktopApp:
         self.probe_button = ctk.CTkButton(
             export, text="先检查第一章", command=self.probe, height=36,
             corner_radius=6, fg_color=self.CARD, hover_color=self.SUNKEN,
-            border_width=1, border_color="#D5D9DF",
+            border_width=1, border_color=self.BORDER,
             text_color=self.MUTED, font=_font(13))
         self.probe_button.grid(row=1, column=0, padx=(18, 6), pady=(6, 10), sticky="ew")
         self.export_button = ctk.CTkButton(
             export, text="开始下载 / 继续下载", height=36, command=self.export,
             corner_radius=6, fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
-            text_color="#FFFFFF", font=_font(13))
+            text_color=self.ON_ACCENT, font=_font(13))
         self.export_button.grid(row=1, column=1, columnspan=3, padx=(6, 18),
                                 pady=(6, 10), sticky="ew")
 
@@ -2615,7 +3326,7 @@ class DesktopApp:
         self.scan_now_button = ctk.CTkButton(
             self.scan_only_frame, text="去扫码登录", height=34, command=self.open_login,
             corner_radius=6, fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
-            text_color="#FFFFFF", font=_font(13))
+            text_color=self.ON_ACCENT, font=_font(13))
         self.scan_now_button.pack(anchor="w")
 
         # Both fields: first run, or a credential file that cannot be read.
@@ -2644,12 +3355,12 @@ class DesktopApp:
         ctk.CTkButton(creds_buttons, text="保存", width=96, height=32,
                       command=self._save_creds_inline,
                       corner_radius=6, fg_color=self.ACCENT,
-                      hover_color=self.ACCENT_HOVER, text_color="#FFFFFF",
+                      hover_color=self.ACCENT_HOVER, text_color=self.ON_ACCENT,
                       font=_font(13)).pack(side="left")
         ctk.CTkButton(creds_buttons, text="打开 skills 页面", width=140, height=32,
                       command=lambda: __import__("webbrowser").open(SKILLS_URL),
                       corner_radius=6, fg_color=self.CARD, hover_color=self.SUNKEN,
-                      border_width=1, border_color="#D5D9DF",
+                      border_width=1, border_color=self.BORDER,
                       text_color=self.MUTED, font=_font(13)).pack(side="left",
                                                                  padx=(10, 0))
         self.creds_error = ctk.CTkLabel(self.fields_frame, text="", anchor="w",
@@ -2676,7 +3387,7 @@ class DesktopApp:
         task_row.grid(row=4, column=0, columnspan=4, sticky="ew", padx=18, pady=(0, 10))
         self.pause_button = ctk.CTkButton(
             task_row, text="暂停下载", width=104, height=32, corner_radius=6,
-            fg_color=self.RED_TINT, hover_color="#F6DEDE", text_color=self.RED,
+            fg_color=self.RED_TINT, hover_color=self.RED_TINT, text_color=self.RED,
             font=_font(12), command=self._on_pause_click, state="disabled")
         self.pause_button.pack(side="left")
         self.retry_button = self._quiet_button(task_row, "重试", 64, self._retry_last)
@@ -2753,6 +3464,48 @@ class DesktopApp:
         except Exception:
             pass
 
+    def _on_status_changed(self, *_args) -> None:
+        """状态文本变化时按语义着色：失败最醒目，成功次之，进行中有存在感。
+
+        关键词按优先级匹配：一句话同时含"成功"与"未完成"（队列汇总就是
+        这种）按失败处理——用户最需要先看见的是出问题的那部分。
+
+        必须全程吞异常：这个回调挂在 StringVar 的 trace 上，窗口关闭时
+        控件先被销毁、status 仍可能被写（shutdown/后台线程），此时
+        winfo_exists/configure 会抛 TclError；异常会冒到 Tk 的
+        report_callback_exception -> _handle_callback_exception -> 又写
+        status -> 再次触发本回调，形成递归把主循环拖死（表现为窗口关不掉、
+        按钮全部没反应）。着色失败不影响任何功能，静默即可。
+        """
+        if getattr(self, "_closing", False):
+            return
+        try:
+            labels = [getattr(self, "status_label", None),
+                      getattr(self, "global_status_label", None)]
+            text = self.status.get()
+            if any(key in text for key in ("失败", "未完成", "没下完", "错误",
+                                            "不行", "读取不到", "过期")):
+                color = self.RED
+            elif any(key in text for key in ("完成", "成功", "通过", "已删除",
+                                             "已清除", "已加入", "已全选", "正常",
+                                             "收工")):
+                color = self.GREEN
+            elif any(key in text for key in ("正在", "继续", "重试", "准备",
+                                             "等待", "退避", "队列")):
+                color = self.ACCENT_ON_TINT
+            else:
+                color = self.MUTED
+            for label in labels:
+                if label is None:
+                    continue
+                try:
+                    if label.winfo_exists():
+                        label.configure(text_color=color)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
     def _log(self, text: str) -> None:
         """Persist one worker line to the log file.
 
@@ -2772,6 +3525,44 @@ class DesktopApp:
         buffer without bound between ticks.
         """
         self._log_buffer.clear()
+
+    def _track_worker(self, process) -> None:
+        with self._workers_lock:
+            self._live_workers.add(process)
+
+    def _untrack_worker(self, process) -> None:
+        if process is None:
+            return
+        with self._workers_lock:
+            self._live_workers.discard(process)
+
+    def _terminate_all_workers(self) -> None:
+        """Kill every worker we know about without blocking the Tk thread.
+
+        Closing used to terminate only self.process, so a spawn still in flight
+        and an already-exited-but-unadopted process could survive the window.
+        Waiting for each exit happens on a throwaway thread; the window has no
+        reason to sit through it.
+        """
+        with self._workers_lock:
+            processes = list(self._live_workers)
+            self._live_workers.clear()
+        if not processes:
+            return
+        for process in processes:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+        def reap():
+            for process in processes:
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    pass
+
+        threading.Thread(target=reap, daemon=True).start()
 
     def _is_busy(self) -> bool:
         # A spawn in flight counts as busy: the user cannot start a second
@@ -2870,6 +3661,10 @@ class DesktopApp:
                 self.events.put(("spawn-failed", (action, f"{type(exc).__name__}: {exc}")))
                 return
             spawn_ms = (time.perf_counter() - spawn_started) * 1000.0
+            # Register before announcing it. Between Popen returning and the
+            # "spawned" event being handled, the process existed but was in no
+            # registry, so closing the window in that window left it running.
+            self._track_worker(process)
             # 记下进程刚建好的时刻：子进程真正开始输出还要多久，决定了用户
             # 感知到的"点了没反应"到底出在 CreateProcess 还是引擎启动上。
             self._spawn_at = time.perf_counter()
@@ -3010,7 +3805,11 @@ class DesktopApp:
                     % (time.strftime("%H:%M:%S"), gap_ms, blocked_ms,
                        self.current_action or "-", self.events.qsize()))
             try:
-                self.root.after(100, self._poll)
+                # When work is still waiting, come back quickly instead of
+                # paying another full 100 ms; when idle, stay quiet so Tk can
+                # coalesce paints.
+                delay = 8 if self.events.qsize() else 100
+                self.root.after(delay, self._poll)
             except Exception:
                 pass
 
@@ -3120,37 +3919,67 @@ class DesktopApp:
             return "<stack unavailable: %s>" % type(exc).__name__
 
     def _drain_events(self):
+        """Handle one bounded slice of the worker event queue.
+
+        Two limits, because either one alone leaves a freeze:
+        a count cap (a burst must not catch up forever) and a wall-clock budget
+        (200 expensive events are not the same as 200 cheap ones). Each event is
+        isolated: one malformed message must never stop a "done" from arriving,
+        or the window stays "busy" with no task behind it.
+        """
+        deadline = time.perf_counter() + EVENT_TICK_BUDGET_S
+        heavy_done = 0
+        self._in_event_batch = True
         try:
             for _ in range(MAX_EVENTS_PER_TICK):
                 try:
                     kind, value = self.events.get_nowait()
                 except queue.Empty:
                     break
-                if kind == "cover":
-                    self._apply_detail_cover(value)
-                elif kind == "cover-error":
-                    self.cover.configure(text="封面暂不可用", image=None)
-                elif kind == "card-cover":
-                    self._apply_card_cover(*value)
-                elif kind == "shelf-cover":
-                    self._apply_shelf_cover(*value)
-                elif kind == "login":
-                    self._handle_login_event(*value)
-                elif kind == "spawned":
-                    self._handle_spawned(*value)
-                elif kind == "spawn-failed":
-                    self._handle_spawn_failed(*value)
-                elif kind == "service-miss":
-                    self._on_service_miss(*value)
-                elif kind == "done":
-                    self._handle_done(*value)
-                elif kind == "update-failed":
-                    self._on_update_failed(*value)
-                elif kind == "update":
-                    self._handle_update(*value)
-                else:
-                    self._handle_line(value)
+                # Image events are the ones that can cost tens of milliseconds
+                # each. Text lines are cheap, and cutting them off would only
+                # slow a search down for no responsiveness gain.
+                heavy = kind in ("card-cover", "shelf-cover", "cover")
+                if heavy:
+                    heavy_done += 1
+                try:
+                    if kind == "cover":
+                        self._apply_detail_cover(value)
+                    elif kind == "cover-error":
+                        self.cover.configure(text="封面暂不可用", image=None)
+                    elif kind == "card-cover":
+                        self._apply_card_cover(*value)
+                    elif kind == "shelf-cover":
+                        self._apply_shelf_cover(*value)
+                    elif kind == "login":
+                        self._handle_login_event(*value)
+                    elif kind == "spawned":
+                        self._handle_spawned(*value)
+                    elif kind == "spawn-failed":
+                        self._handle_spawn_failed(*value)
+                    elif kind == "service-miss":
+                        self._on_service_miss(*value)
+                    elif kind == "done":
+                        self._handle_done(*value)
+                    elif kind == "update-failed":
+                        self._on_update_failed(*value)
+                    elif kind == "update":
+                        self._handle_update(*value)
+                    else:
+                        self._handle_line(value)
+                except Exception:
+                    # Keep the batch alive. A single bad event used to skip
+                    # every event behind it until the next tick.
+                    self._persist_log("[EVENT_ERROR] %s: %s"
+                                      % (kind, sys.exc_info()[1]))
+                if heavy_done >= 8 and time.perf_counter() >= deadline:
+                    # Expensive image events stop here; the rest waits for the
+                    # next 8 ms tick. Cheap line bursts are unaffected.
+                    break
         finally:
+            self._in_event_batch = False
+            if self._render_after_id is not None:
+                self._flush_page_render()
             # One widget update per tick rather than four per line.
             self._flush_log_panel()
 
@@ -3158,7 +3987,10 @@ class DesktopApp:
         try:
             photo = ctk.CTkImage(light_image=image, dark_image=image,
                                  size=(self.DETAIL_COVER_W, self.DETAIL_COVER_H))
+            # Only the detail pane uses this list now; `cover_image` holds the
+            # visible one, so keep a short history instead of the whole session.
             self._image_refs.append(photo)
+            del self._image_refs[:-16]
             self.cover_image = photo
             self.cover.configure(text="", image=photo)
         except Exception:
@@ -3178,10 +4010,17 @@ class DesktopApp:
         try:
             slot = (self.COVER_W // 2, self.COVER_H // 2)
             photo = ImageTk.PhotoImage(image.resize(slot))
-            self._image_refs.append(photo)
+            # No session-long _image_refs entry here: the canvas keeps the photo
+            # in its own _photos map and the card entry keeps widget["image"].
+            # Appending every decoded cover to one list was a slow leak across
+            # hundreds of searches.
             widget["image"] = photo
             self.results.set_cover(book_id, photo)
-        except Exception:
+        except Exception as exc:
+            # A failed PhotoImage used to be invisible: the row silently kept
+            # its placeholder and nothing said why.
+            self._persist_log("[COVER] card cover failed for %s: %r"
+                              % (book_id, exc))
             self.results.set_cover(book_id, None)
 
     def _parse_shelf(self, value: str):
@@ -3201,7 +4040,7 @@ class DesktopApp:
             if image is None:
                 return
             photo = ImageTk.PhotoImage(image)
-            self._image_refs.append(photo)
+            # The shelf canvas owns the reference in its _photos map.
             self.shelf_frame.set_cover(book_id, photo)
         except Exception:
             pass
@@ -3279,6 +4118,11 @@ class DesktopApp:
         if value.startswith("[THROTTLED]") and "did not clear" in value:
             self.status.set("微信读书的频率限制没有在本次运行内解除，部分章节未取到。"
                             "断点已保留，稍后点“继续下载”即可接着跑。")
+        if value.startswith("[SKIPPED]"):
+            # 不是失败：服务器没有这一章的正文，重试也变不出来。说清"跳过了、
+            # 别的章节照常、以后能再试"，比让用户以为整本卡住要好。
+            self.status.set("有一章微信读书没有返回正文，已跳过它继续下载其它章节；"
+                            "成品里会留一页说明，重新下载可再试这一章。")
         if value.startswith("[RETRY]"):
             # "网络或数据校验" was a catch-all that covered a rate limit, a
             # bad transfer and a genuinely corrupt chapter alike, so the user
@@ -3306,6 +4150,9 @@ class DesktopApp:
         if job != self.job_seq:
             return  # a finished, superseded worker must not reset live state
         action = self.current_action
+        untrack = getattr(self, "_untrack_worker", None)
+        if untrack is not None:
+            untrack(self.process)
         self.process = None
         if self._service_job == job:
             self._service_job = None
@@ -3319,6 +4166,37 @@ class DesktopApp:
         try:
             if self.last_failure:
                 self._finish_failed_action(action)
+                # 单本下载失败自动重连一次：瞬态故障（限流坏窗口/网络抖动/
+                # 章节校验失败）隔几秒大多自愈，断点续传让重跑只补缺章。
+                # 队列模式下不在这里重试——队列有自己的整轮补跑，避免双份。
+                if (action == "export" and not self.queue_running
+                        and not self._pause_requested):
+                    book = self._queue_book or {
+                        "bookId": self.selected_id, "title": self.selected_title,
+                        "author": self.selected_author}
+                    bid = str(book.get("bookId") or "")
+                    if bid and self._export_auto_retried != bid and not self._is_busy():
+                        self._export_auto_retried = bid
+                        label = book.get("title") or bid
+                        self.status.set("《%s》这次没下完（断点已保留）。15 秒后自动重试一次"
+                                        "（只补缺的章节）；你现在也可以直接点「重试」或重新开始。"
+                                        % label)
+                        self._persist_log("[AUTO_RETRY] scheduling one automatic "
+                                          "retry for %s" % bid)
+                        def _auto_retry(b=book):
+                            # 窗口正在关、已有任务、或正开着对话框（比如用户
+                            # 已经在手动确认重下）——一律不抢：抢跑会让用户
+                            # 接下来的点击被「当前还有任务在运行」挡住，看起来
+                            # 就是按钮卡死。
+                            if getattr(self, "_closing", False):
+                                return
+                            if self._is_busy() or self._modal_depth > 0:
+                                return
+                            self.last_failure_status = None
+                            self.retry_button.pack_forget()
+                            self._start_one(b, prefix="自动重试：准备下载")
+                        self.root.after(15000, _auto_retry)
+                        return
             elif action == "search":
                 if code != 0:
                     self.status.set("搜索没有完成。请稍后再试，或点“检查登录”确认登录状态。")
@@ -3402,14 +4280,44 @@ class DesktopApp:
                         self.last_failure_status or
                         ("任务退出码 %s，未完成" % code if code else "仍有未解决章节"))
                     self.queue_results.append((label, success, reason))
+                    if not success:
+                        # 失败的书记下完整信息：队列尾部自动补跑一轮要用。
+                        self._queue_failed_books.append(dict(current))
+                    second_round = False
                     nxt = self._pop_next_book()
+                    if nxt is None and self._queue_failed_books:
+                        # 队列跑完还有失败的书：没补跑过的自动再来一轮。
+                        # 限流坏窗口/网络抖动在第一轮过后大多已恢复，断点
+                        # 续传让第二轮只补缺章，代价很小；每本只补一次。
+                        pending = [b for b in self._queue_failed_books
+                                   if str(b.get("bookId") or "") not in self._queue_retried]
+                        if pending:
+                            for b in pending:
+                                self._queue_retried.add(str(b.get("bookId") or ""))
+                            retried_ids = {str(b.get("bookId") or "") for b in pending}
+                            self._queue_failed_books = [
+                                b for b in self._queue_failed_books
+                                if str(b.get("bookId") or "") not in retried_ids]
+                            self.download_queue = pending + self.download_queue
+                            self._persist_log(
+                                "[QUEUE_RETRY] 自动补跑 %d 本：%s"
+                                % (len(pending), "、".join(
+                                    str(b.get("title") or b.get("bookId")) for b in pending)))
+                            second_round = True
+                            nxt = self._pop_next_book()
                     if nxt is not None:
                         reason = "；上一本未完成，断点已保留" if not success else ""
-                        self.status.set("队列继续：开始下载《%s》（剩余 %d 本%s）。"
-                                        % (nxt.get("title") or nxt.get("bookId", ""),
-                                           len(self.download_queue), reason))
-                        self._select_book(nxt, load_info=False)
-                        self._start_one(nxt)
+                        if second_round:
+                            self.status.set("自动补跑开始：还剩 %d 本失败的书。"
+                                            % (len(self.download_queue) + 1))
+                            self._select_book(nxt, load_info=False)
+                            self._start_one(nxt, prefix="自动补跑：准备下载")
+                        else:
+                            self.status.set("队列继续：开始下载《%s》（剩余 %d 本%s）。"
+                                            % (nxt.get("title") or nxt.get("bookId", ""),
+                                               len(self.download_queue), reason))
+                            self._select_book(nxt, load_info=False)
+                            self._start_one(nxt)
                     else:
                         self._queue_book = None
                         self.queue_running = False
@@ -3417,18 +4325,40 @@ class DesktopApp:
                         self._queue_skipped.clear()
                         self.pause_button.configure(text="暂停下载", state="disabled")
                         failed = [r for r in self.queue_results if not r[1]]
+                        # 失败的书放回队列（按 bookId 去重、保持原顺序）：
+                        # 队列按钮的计数从此就是「还剩几本可以重试」，点开
+                        # 队列 -> 开始队列下载即只重跑失败的，已成功的不重复下。
+                        retry_books, seen_ids = [], set()
+                        for book in self._queue_failed_books:
+                            bid = str(book.get("bookId") or "")
+                            if bid and bid not in seen_ids:
+                                seen_ids.add(bid)
+                                retry_books.append(book)
+                        if retry_books:
+                            self.download_queue = retry_books + self.download_queue
+                        self._queue_failed_books = []
+                        self._queue_retried.clear()
                         self._refresh_queue_button()
                         if failed:
-                            lines = "；".join(
-                                "%s：%s" % (title, _tidy_reason(why))
-                                for title, _ok, why in failed)
-                            self.status.set("队列结束：%d 本成功，%d 本未完成。"
-                                            % (len(self.queue_results) - len(failed),
-                                               len(failed)))
+                            # 同一本可能失败两次（首轮+补跑），汇总只列一次。
+                            seen_titles, lines_list = set(), []
+                            for title, _ok, why in failed:
+                                if title in seen_titles:
+                                    continue
+                                seen_titles.add(title)
+                                lines_list.append("%s：%s" % (title, _tidy_reason(why)))
+                            lines = "；".join(lines_list)
+                            self.status.set(
+                                "队列结束：%d 本未完成，已放回队列——点顶栏「队列」→"
+                                "「开始队列下载」即可只重跑这些书。"
+                                % (len(retry_books) or len(seen_titles)))
                             self._show_notice(
                                 "队列结束，有书没完成",
                                 "未完成的书：" + lines + chr(10) * 2 +
-                                "已下载的章节都保留，可在书架里点那本书继续下载。")
+                                (("失败的 %d 本已放回队列，点「队列」→「开始队列下载」"
+                                  "可单独重试，已下载的章节会续传。\n\n" % len(retry_books))
+                                 if retry_books else "") +
+                                "也可以「查看技术日志」确认具体卡在哪一章。")
                         else:
                             self.status.set("队列已全部完成（%d 本）。"
                                             % len(self.queue_results))
@@ -3481,15 +4411,14 @@ class DesktopApp:
     def _finish_card_categories(self):
         for book_id, widget in self.card_widgets.items():
             label = widget.get("category")
-            if label is None:
-                continue
-            if str(label.cget("text")).strip() in ("", "分类加载中…"):
+            if label is not None and str(label.cget("text")).strip() in ("", "分类加载中…"):
                 label.configure(text="分类：暂无信息")
-                # 也记进数据里：选中这本书会 _render_page() 重建卡片，不记的话
-                # 新卡片又回到「分类加载中…」，看起来像一直没加载出来。
-                row = self.book_rows.get(book_id)
-                if row is not None and not str(row.get("category") or "").strip():
-                    row["category"] = "暂无信息"
+        # 数据填充与屏幕上有没有卡片无关：行内已不再画分类（label 为 None），
+        # 而搜索结果改成按 tick 合并渲染后，done 事件可能先于第一次渲染到达，
+        # 这时 card_widgets 还是空的。只遍历卡片会让分类永远停在空串。
+        for row in self.book_rows.values():
+            if row is not None and not str(row.get("category") or "").strip():
+                row["category"] = "暂无信息"
 
     def _update_card_category(self, book_id: str, category: str):
         # Always record the value: the row may not be on the page on screen.
@@ -3562,6 +4491,7 @@ class DesktopApp:
         Building the widgets and letting Tk repaint them is the expensive part,
         so this only ever touches one page's worth of children.
         """
+        started = time.perf_counter()
         self.card_widgets.clear()
         page = self._page_slice()
         self.results.rows_changed(page)
@@ -3569,6 +4499,35 @@ class DesktopApp:
             self._register_card(item)
         self._set_page_buttons(self.page_index, self._page_count())
         self._refresh_queue_add()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        # Measured baseline for the next round of work: a page render should be
+        # tens of milliseconds, not hundreds. Only slow ones are logged.
+        if elapsed_ms > 50:
+            self._persist_log("[PERF] render_page %.0fms rows=%d"
+                              % (elapsed_ms, len(page)))
+
+    def _schedule_page_render(self) -> None:
+        """Coalesce many "a row arrived" notifications into one page render."""
+        if self._render_after_id is not None or self._closing:
+            return
+        try:
+            self._render_after_id = self.root.after(16, self._flush_page_render)
+        except Exception:
+            self._render_after_id = None
+
+    def _flush_page_render(self) -> None:
+        after_id, self._render_after_id = self._render_after_id, None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        if self._closing:
+            return
+        try:
+            self._render_page()
+        except Exception:
+            self._handle_callback_exception(*sys.exc_info())
 
     def _add_book_card(self, item: dict):
         """Record a search result, paging the list if it grew past the page."""
@@ -3586,8 +4545,14 @@ class DesktopApp:
         total = self._page_count()
         self.page_index = min(self.page_index, total - 1)
         if bid in {str(row.get("bookId") or "") for row in self._page_slice()}:
-            # The result belongs to the page on screen: redraw the canvas rows.
-            self._render_page()
+            if self._in_event_batch:
+                # 15 results arrive as 15 lines. Rendering the page on each of
+                # them cost 15 full redraws and a fresh cover request per row;
+                # one deferred render at the end of the tick does the same work
+                # once.
+                self._schedule_page_render()
+            else:
+                self._render_page()
         self._refresh_pager_text()
 
     def _refresh_pager_text(self) -> None:
@@ -3611,37 +4576,139 @@ class DesktopApp:
         self.card_widgets[bid] = {
             "frame": None, "bar": None,
             "cover": _CanvasText(self.results, entry["cover_text"]),
-            "category": _CanvasText(self.results, entry["category"]),
+            # 2026-10-28 起行里不再画分类（详情区还有），item 为 None；
+            # 保持 key 存在以免下游 KeyError，但不再包 _CanvasText——
+            # 包装 None 会让 itemcget 缺参数直接 TclError。
+            "category": None,
             "image": None,
         }
         self._request_card_cover(bid, str(item.get("cover") or "").strip())
 
     def _request_card_cover(self, book_id: str, url: str):
+        self._request_cover(url, (self.COVER_W, self.COVER_H), "card", book_id)
+
+    def _request_cover(self, url: str, box: tuple, kind: str, key: str) -> None:
+        """Ask for one cover at one display size.
+
+        Every cover in the window goes through here: result cards, shelf rows
+        and the detail pane. Three rules keep it cheap:
+
+        * a URL is fetched at most once at a time, no matter how many rows want
+          it (a re-render used to start a new thread per row);
+        * a decoded image is cached per (URL, size), so turning a page back and
+          forth never touches the network again;
+        * a hard failure is remembered, so a dead image is not retried on every
+          redraw.
+        """
         if not url:
-            self._apply_card_cover(book_id, None)
+            self._deliver_cover(kind, key, None)
             return
-        card_box = (self.COVER_W, self.COVER_H)
-        cached = self.cover_cache.get(url)
-        if cached is not None and _covers_box(cached, card_box):
-            self._apply_card_cover(book_id, cached)
+        slot = (url, int(box[0]), int(box[1]))
+        cached = self._cover_images.get(slot)
+        if cached is not None:
+            self._deliver_cover(kind, key, cached)
             return
+        if slot in self._cover_failed:
+            self._deliver_cover(kind, key, None)
+            return
+        # Older sessions stored a single card-sized image under the bare URL.
+        legacy = self.cover_cache.get(url)
+        if _covers_box(legacy, box):
+            self._cover_images[slot] = legacy
+            self._deliver_cover(kind, key, legacy)
+            return
+        self._cover_waiters.setdefault(url, []).append((kind, key, tuple(box)))
+        if url in self._cover_inflight:
+            return
+        self._cover_inflight.add(url)
+        threading.Thread(target=self._fetch_cover, args=(url,), daemon=True).start()
 
-        def fetch():
-            image = None
-            try:
-                response = requests.get(url, timeout=(5, 15))
+    def _fetch_cover(self, url: str) -> None:
+        """Background: download once, decode per waiting slot, then notify."""
+        payload = None
+        permanent_failure = False
+        try:
+            with self.cover_slots:
+                response = requests.get(url, timeout=COVER_TIMEOUT, stream=True)
                 response.raise_for_status()
-                if len(response.content) <= 8 * 1024 * 1024:
-                    # Decode here, off the Tk thread: this is the expensive part.
-                    image = _decode_cover(response.content, card_box)
-            except Exception:
-                image = None
-            if len(self.cover_cache) > 64:
-                self.cover_cache.clear()
-            self.cover_cache[url] = image
-            self.events.put(("card-cover", (book_id, image)))
+                chunks, total = [], 0
+                # Check the cap while reading: the old code read the whole body
+                # into memory and only then asked how big it was.
+                stream = getattr(response, "iter_content", None)
+                if callable(stream):
+                    for chunk in stream(64 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > COVER_MAX_BYTES:
+                            raise ValueError("cover too large")
+                        chunks.append(chunk)
+                    payload = b"".join(chunks)
+                else:
+                    # Fakes and older transports may only expose .content.
+                    body = response.content or b""
+                    if len(body) > COVER_MAX_BYTES:
+                        raise ValueError("cover too large")
+                    payload = body
+        except Exception as exc:
+            payload = None
+            # A 403/404 is permanent; a timeout or reset is not, and caching it
+            # would leave a blank cover for the rest of the session.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            permanent_failure = bool(status and 400 <= int(status) < 500)
+        waiters = self._cover_waiters.pop(url, [])
+        self._cover_inflight.discard(url)
+        for kind, key, box in waiters:
+            image = None
+            if payload:
+                try:
+                    image = _decode_cover(payload, box)
+                except Exception:
+                    image = None
+            slot = (url, int(box[0]), int(box[1]))
+            if image is None:
+                if permanent_failure:
+                    self._cover_failed.add(slot)
+                if kind == "detail":
+                    self.events.put(("cover-error", ""))
+                    continue
+                self.events.put((self._cover_event(kind), (key, None)))
+                continue
+            self._cover_images[slot] = image
+            if kind == "detail":
+                # Detail keeps the legacy cache so an already-loaded cover is
+                # reused when the same book is selected again.
+                self.cover_cache[url] = image
+            self._trim_cover_cache()
+            if kind == "detail":
+                self.events.put(("cover", image))
+            else:
+                self.events.put((self._cover_event(kind), (key, image)))
 
-        threading.Thread(target=fetch, daemon=True).start()
+    @staticmethod
+    def _cover_event(kind: str) -> str:
+        return "shelf-cover" if kind == "shelf" else "card-cover"
+
+    def _trim_cover_cache(self) -> None:
+        while len(self._cover_images) > COVER_CACHE_LIMIT:
+            try:
+                self._cover_images.pop(next(iter(self._cover_images)))
+            except (StopIteration, KeyError):
+                break
+
+    def _deliver_cover(self, kind: str, key: str, image) -> None:
+        """Apply a cover that was already decoded (Tk thread)."""
+        if kind == "card":
+            self._apply_card_cover(key, image)
+        elif kind == "shelf":
+            self._apply_shelf_cover(key, image)
+        elif image is None:
+            try:
+                self.cover.configure(text="封面暂不可用", image=None)
+            except Exception:
+                pass
+        else:
+            self._apply_detail_cover(image)
 
     def search(self):
         keyword = self.search_entry.get().strip()
@@ -3658,6 +4725,14 @@ class DesktopApp:
             return
         for widget in self.results.content.winfo_children():
             widget.destroy()
+        # Drop a render queued by the previous search: it would paint the old
+        # page over the fresh empty state.
+        if self._render_after_id is not None:
+            try:
+                self.root.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+            self._render_after_id = None
         self.book_rows.clear()
         self.card_widgets.clear()
         self.result_rows.clear()
@@ -3828,20 +4903,9 @@ class DesktopApp:
         self.info_loaded = True
 
     def _download_cover(self, url):
-        try:
-            response = requests.get(url, timeout=(5, 15))
-            response.raise_for_status()
-            if len(response.content) > 8 * 1024 * 1024:
-                raise ValueError("cover too large")
-            # Decoded on this background thread so the Tk loop stays free.
-            image = _decode_cover(response.content,
-                                  (self.DETAIL_COVER_W, self.DETAIL_COVER_H))
-            if len(self.cover_cache) > 64:
-                self.cover_cache.clear()
-            self.cover_cache[url] = image
-            self.events.put(("cover", image))
-        except Exception:
-            self.events.put(("cover-error", ""))
+        """Detail-pane cover: same loader, detail size."""
+        self._request_cover(url, (self.DETAIL_COVER_W, self.DETAIL_COVER_H),
+                            "detail", "")
 
     def _set_intro(self, text):
         self.intro.configure(state="normal")
@@ -3925,7 +4989,7 @@ class DesktopApp:
         self.login_otp_button = ctk.CTkButton(self.login_otp_row, text="提交验证码", width=110,
                                               height=34, corner_radius=8,
                                               fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER,
-                                              text_color="#FFFFFF", font=_font(13),
+                                              text_color=self.ON_ACCENT, font=_font(13),
                                               state="disabled", command=self._submit_login_otp)
         self.login_otp_button.pack(side="left", padx=(8, 0))
 
@@ -3974,7 +5038,7 @@ class DesktopApp:
         manual_buttons.pack(fill="x", padx=20, pady=(0, 18))
         ctk.CTkButton(manual_buttons, text="保存并使用", width=130, height=34,
                       corner_radius=8, fg_color=self.ACCENT,
-                      hover_color=self.ACCENT_HOVER, text_color="#FFFFFF",
+                      hover_color=self.ACCENT_HOVER, text_color=self.ON_ACCENT,
                       font=_font(13),
                       command=self._save_manual_credentials).pack(side="left")
 
@@ -4420,7 +5484,11 @@ class DesktopApp:
         return out
 
     def _refresh_queue_button(self) -> None:
-        text = "队列 %d 本" % len(self.download_queue)
+        # 正在下载的那本已从 download_queue 里弹出，但用户看到的队列应该是
+        # "还包括它"。不计它就会出现"运行中却显示 0 本"。
+        running_one = 1 if (self.queue_running and not self.queue_paused
+                            and self._queue_book) else 0
+        text = "队列 %d 本" % (len(self.download_queue) + running_one)
         if self.queue_paused:
             text += "（已暂停）"
         elif self.queue_running:
@@ -4445,25 +5513,48 @@ class DesktopApp:
         self.status.set("队列已清空。")
 
     def _show_queue(self) -> None:
-        """队列详情：每本一行，可移除；底部清空/关闭。"""
-        if not self.download_queue:
+        """队列详情：正在下载 + 等待中的书，各自一行。
+
+        旧版只渲染 download_queue，而队列启动时会把当前这本从里面弹出去，
+        于是"最后一本正在下载"时点队列会看到"队列是空的"。现在当前项单独
+        展示，按钮计数也把它算进去。
+        """
+        current = (self._queue_book
+                   if self.queue_running and not self.queue_paused else None)
+        waiting = list(self.download_queue)
+        total = len(waiting) + (1 if current else 0)
+        self._refresh_queue_button()
+        if not total:
             self._ask("showinfo", "队列是空的",
                       "先勾选左侧的书，再点「加入队列」。")
             return
         dialog = ctk.CTkToplevel(self.root)
-        dialog.title("下载队列（%d 本）" % len(self.download_queue))
+        dialog.title("下载队列（共 %d 本%s）"
+                     % (total, " · 运行中" if self.queue_running else ""))
         dialog.transient(self.root)
         dialog.resizable(False, False)
         dialog.grab_set()
-        # 高度跟着书数走：固定 260 时队列只有 1 本也拉出一个大空白框，
-        # 看起来像内容没加载出来。4 本以内正好贴边，更多才滚动。
-        rows_height = min(260, 22 + 46 * len(self.download_queue))
-        body = self._scrollable(dialog, width=460, height=rows_height,
+        # 高度跟着条目数走：1 本也拉一个大空白框会像没加载出来。
+        rows_height = min(300, 26 + 50 * total)
+        body = self._scrollable(dialog, width=480, height=rows_height,
                                       fg_color=self.CARD, corner_radius=0)
-        # expand=False：让对话框按内容收缩。之前 expand=True 会把滚动区拉满
-        # 整个 Toplevel，1 本书也是一个大白框。
         body.pack(fill="both", padx=14, pady=(14, 6))
-        for index, book in enumerate(list(self.download_queue), 1):
+
+        if current:
+            row = ctk.CTkFrame(body, fg_color=self.GREEN_TINT, corner_radius=8)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text="正在下载", text_color=self.GREEN,
+                         font=_font(11, "bold")).pack(side="left", padx=(10, 8),
+                                                      pady=8)
+            ctk.CTkLabel(row, text=current.get("title") or current.get("bookId"),
+                         text_color=self.INK, anchor="w", font=_font(12),
+                         wraplength=300, justify="left").pack(
+                side="left", fill="x", expand=True, pady=8)
+            ctk.CTkLabel(row, text="%d%%" % int(self.progress.get() * 100),
+                         text_color=self.GREEN, font=_font(11)).pack(
+                side="right", padx=(8, 10))
+
+        for index, book in enumerate(waiting, 1):
             row = ctk.CTkFrame(body, fg_color="transparent")
             row.pack(fill="x", pady=2)
             ctk.CTkLabel(row, text="%d. %s" % (index, book.get("title") or book.get("bookId")),
@@ -4473,22 +5564,31 @@ class DesktopApp:
                                lambda b=book: (self._remove_from_queue(str(b.get("bookId") or "")),
                                                dialog.destroy(), self._show_queue())
                                ).pack(side="right")
+        if current and not waiting:
+            ctk.CTkLabel(body, text="队列里没有等待的书。", text_color=self.FAINT,
+                         font=_font(11)).pack(anchor="w", padx=6, pady=(6, 2))
+
         row = ctk.CTkFrame(dialog, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=(0, 14))
-        self._quiet_button(row, "清空队列", 96,
-                           lambda: (self._clear_queue(), dialog.destroy())).pack(side="left")
+        clear_button = self._quiet_button(
+            row, "清空队列", 96,
+            lambda: (self._clear_queue(), dialog.destroy()))
+        clear_button.pack(side="left")
+        if self.queue_running:
+            clear_button.configure(state="disabled")
         self._quiet_button(row, "关闭", 80, dialog.destroy).pack(side="right")
-        # 「开始队列下载」放在这里：它是队列自己的动作，和队列列表在一起，
-        # 不用在顶栏再占一个位置。运行中显示为不可点，暂停时变「继续队列」。
+        # 「开始队列下载」放在这里：它是队列自己的动作，和队列列表在一起。
         if self.queue_running:
             start_text, start_cmd, start_state = "下载中…", None, "disabled"
         elif self.queue_paused:
             start_text, start_cmd, start_state = "继续队列", self._resume_queue, "normal"
-        else:
+        elif waiting:
             start_text, start_cmd, start_state = "开始队列下载", self._start_queue, "normal"
+        else:
+            start_text, start_cmd, start_state = "没有等待中的书", None, "disabled"
         start_button = ctk.CTkButton(
             row, text=start_text, width=124, height=34, corner_radius=6,
-            fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER, text_color="#FFFFFF",
+            fg_color=self.ACCENT, hover_color=self.ACCENT_HOVER, text_color=self.ON_ACCENT,
             font=_font(12), state=start_state,
             command=(lambda: (dialog.destroy(), start_cmd())) if start_cmd else None)
         start_button.pack(side="right", padx=(0, 8))
@@ -4528,15 +5628,22 @@ class DesktopApp:
         # --unified-appendix，让书末多出注释分册和想法册（参考 EPUB 的形态）。
         return args + self._annotation_flags(appendix=True)
 
-    def _start_one(self, book: dict) -> None:
-        """起一本的下载（队列与单本共用）。不弹确认框，直接跑。"""
+    def _start_one(self, book: dict, prefix: str = "正在准备下载") -> None:
+        """起一本的下载（队列与单本共用）。不弹确认框，直接跑。
+
+        prefix 让补跑场景能说清楚自己：自动补跑也会走这里，若不区分，
+        状态栏刚写下的「自动补跑」立刻被默认前缀覆盖，用户看不见。
+        """
         self.progress.set(0)
         self._queue_book = {"bookId": str(book.get("bookId") or ""),
                             "title": book.get("title") or "",
                             "author": book.get("author") or ""}
+        refresh = getattr(self, "_refresh_queue_button", None)
+        if refresh is not None:
+            refresh()
         if not self._start_worker(self._queue_args(book), "export",
-                                  "正在准备下载《%s》并检查本地断点…"
-                                  % (book.get("title") or book.get("bookId", ""))):
+                                  "%s《%s》并检查本地断点…"
+                                  % (prefix, book.get("title") or book.get("bookId", ""))):
             self._handle_spawn_failed("export", "Worker start rejected")
 
     def _start_queue(self) -> None:
@@ -4556,6 +5663,8 @@ class DesktopApp:
         self.queue_running = True
         self.queue_paused = False
         self.queue_results.clear()
+        self._queue_retried.clear()
+        self._queue_failed_books.clear()
         first = self._pop_next_book()
         self._refresh_queue_button()
         if first is None:
@@ -4585,6 +5694,9 @@ class DesktopApp:
             "title": self.selected_title,
             "author": self.selected_author,
         })
+        # 用户手动开始一本新书：清掉单本自动重连的标记，新书失败照样可以
+        # 自动重试一次。
+        self._export_auto_retried = None
 
     # ------------------------------------------------------------------
     # 应用内自更新（GitHub Releases API，薄封装：检测 -> 下载 Setup.exe -> 拉起覆盖）
@@ -4674,22 +5786,48 @@ class DesktopApp:
         self.status.set(message)
         self._ask("showerror", "更新失败", message)
 
+    def _on_close(self) -> None:
+        """点窗口关闭：先立旗让所有回调让路，再停后台进程、销毁窗口。
+
+        不在关窗瞬间直接 destroy 的原因：after 队列里的回调（自动重连、
+        poll）与 status 的 trace 都会在销毁过程中触发，在已销毁控件上
+        抛 TclError，经 report_callback_exception 再写 status -> 递归，
+        结果就是窗口关不掉、按钮没反应。_closing 让这些回调第一行就返回。
+
+        停止进程必须是非阻塞的：旧实现调用 service.shutdown()，而它要抢
+        正在 readline() 的请求所持的锁，于是"搜索中点关闭"会卡到请求回来。
+        现在先杀进程再销毁窗口，回收交给后台线程。
+        """
+        self._closing = True
+        try:
+            self._service.terminate()
+        except Exception:
+            pass
+        try:
+            self._terminate_all_workers()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def shutdown(self) -> None:
         """Window is closing: stop the warm worker and any export still running."""
+        # 先立旗：之后所有 trace/after 回调直接让路，别在销毁中的控件上操作。
+        self._closing = True
         try:
-            _LOG_WRITER.flush(timeout=3.0)   # 进程马上要退，队列里的行必须先落盘
+            _LOG_WRITER.flush(timeout=1.0)   # 进程马上要退，队列里的行必须先落盘
         except Exception:
             pass
         try:
-            self._service.shutdown()
+            self._service.terminate()
         except Exception:
             pass
-        process = self.process
-        if process is not None:
-            try:
-                process.terminate()
-            except Exception:
-                pass
+        try:
+            self._terminate_all_workers()
+        except Exception:
+            pass
 
     def stop(self):
         if not self._is_busy():
@@ -4715,6 +5853,8 @@ class DesktopApp:
             return
         self.last_failure_status = None
         self.retry_button.pack_forget()
+        # 手动重试对自动重连计数重新开始。
+        self._export_auto_retried = None
         self._start_one({"bookId": self.selected_id, "title": self.selected_title,
                          "author": self.selected_author})
 

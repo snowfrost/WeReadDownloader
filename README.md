@@ -2,7 +2,7 @@
 
 把微信读书里的书导出成 EPUB。正文按章节抓取、可断点续传；划线留在正文，注释和想法按你选的方式收进书末附录；一次可以排队下载多本。
 
-Windows 桌面程序，Tk 图形界面，下载引擎是一个独立的 worker 进程。
+Windows 桌面程序，界面用 WebView2（pywebview）渲染，下载引擎是一个独立的 worker 进程。
 
 ![下载工坊](docs/screenshots/01-workflow.png)
 
