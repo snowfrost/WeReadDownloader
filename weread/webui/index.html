@@ -154,11 +154,13 @@
           <div class="panel-head">
             <div><h2>本机已导出</h2><span class="hint" id="exports-count">共 0 项</span></div>
             <div class="panel-tools">
+              <button class="btn tiny" id="exports-export" disabled>导出 EPUB 0 本</button>
               <button class="btn tiny" id="exports-select-all">全选</button>
               <button class="btn tiny" id="exports-delete" disabled>删除选中 0 项</button>
               <button class="btn tiny" id="exports-clean">清半成品保 EPUB</button>
             </div>
           </div>
+          <div class="sources-strip" id="sources-strip"></div>
           <div class="export-list" id="export-list"></div>
         </section>
       </section>
@@ -240,6 +242,41 @@
       <div class="grow"></div>
       <button class="btn ghost" data-close>关闭</button>
       <button class="btn primary" id="queue-start">开始队列下载</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导出 EPUB -->
+<div class="modal-backdrop hidden" id="export-modal">
+  <div class="modal export-modal">
+    <div class="modal-head"><h2>导出 EPUB</h2><button class="icon-btn" data-close>×</button></div>
+    <div class="export-form">
+      <label class="field"><span>目标文件夹</span>
+        <div class="inline-row">
+          <input id="export-target" readonly placeholder="点右侧按钮选择文件夹" />
+          <button class="btn tiny" id="export-pick">选择…</button>
+        </div>
+      </label>
+      <label class="field"><span>重命名规则</span>
+        <input id="export-pattern" value="{title}-{author}-{publisher}" spellcheck="false" />
+      </label>
+      <p class="hint" id="export-tokens">可用占位符：{title} 书名 · {author} 作者 · {publisher} 出版社 · {category} 分类 · {bookId} 书号 · {date} 日期。没有值的字段会连同分隔符一起省略。</p>
+      <p class="hint" id="export-preview">示例：—</p>
+      <label class="field"><span>同名文件</span>
+        <select id="export-conflict">
+          <option value="skip">跳过（保留原有文件）</option>
+          <option value="suffix">加序号（书名 (2).epub）</option>
+          <option value="overwrite">覆盖</option>
+        </select>
+      </label>
+      <div class="export-progress hidden" id="export-progress">
+        <div class="bar"><i id="export-bar"></i></div>
+        <p class="hint" id="export-progress-text"></p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" data-close>关闭</button>
+      <button class="btn primary" id="export-start">开始导出</button>
     </div>
   </div>
 </div>

@@ -7,6 +7,7 @@ WebView2 profile shared with a killed instance (which silently leaves an empty
 JS bridge), and a CSS grid that does not match the row's child order.
 """
 import importlib.util
+import os
 import sys
 import time
 import types
@@ -45,20 +46,22 @@ def test_the_webui_assets_ship_with_the_package():
 
 def test_each_run_gets_its_own_webview_profile():
     """WebView2 locks its user-data folder; a killed instance must not poison
-    the next launch. Every run therefore gets run-<pid>, and stale ones go."""
+    the next launch. Every run therefore gets run-<pid>-<random>, so a reused
+    pid cannot land on a folder the orphaned helpers still hold."""
     base = app.core.PRIVATE / "webview"
-    stale = base / "run-1"
+    stale = base / "run-999999-dead01"
     stale.mkdir(parents=True, exist_ok=True)
-    old = time.time() - 3 * 24 * 3600
-    import os
-    os.utime(stale, (old, old))
+    (stale / "EBWebView").mkdir(exist_ok=True)
 
     profile = app._webview_profile()
     assert profile.is_dir(), profile
-    assert profile.name == "run-%d" % os.getpid(), profile
+    assert profile.name.startswith("run-%d-" % os.getpid()), profile
     # Two runs must never share a folder.
     assert profile != stale
-    assert not stale.exists(), "a profile older than a day should be pruned"
+    assert not stale.exists(), "a leftover profile from a killed run must be removed"
+    first = profile.name
+    profile2 = app._webview_profile()
+    assert profile2.name != first, "profile names must not collide"
 
 
 def test_result_row_grid_matches_the_child_order():
@@ -174,26 +177,29 @@ def test_the_shelf_knows_which_books_are_already_on_disk():
     import tempfile
     with tempfile.TemporaryDirectory(prefix="weread-exports-") as temp:
         root = Path(temp)
-        done = root / "书甲-1234"
+        done = root / "书甲-1234567"
         done.mkdir()
         (done / "书甲 - full.epub").write_bytes(b"x")
-        half = root / "书乙-5678.work"
+        half = root / "书乙-7654321.work"
         half.mkdir()
         (half / "chapter-1.body").write_bytes(b"x")
-        stale = root / "_stale-书丙-9999"
+        stale = root / "_stale-书丙-9999999"
         stale.mkdir()
         (root / "没有书号").mkdir()
 
         original = app.OUTPUT
+        original_core = app.core.OUTPUT
         app.OUTPUT = root
+        app.core.OUTPUT = root
         try:
             index = app.WebApi()._export_index()
         finally:
             app.OUTPUT = original
+            app.core.OUTPUT = original_core
 
-    assert index.get("1234") == "done", index
-    assert index.get("5678") == "partial", index
-    assert index.get("9999") == "partial", index
+    assert index.get("1234567") == "done", index
+    assert index.get("7654321") == "partial", index
+    assert index.get("9999999") == "partial", index
     assert len(index) == 3, index
 
 
@@ -204,6 +210,86 @@ def test_the_shelf_marks_downloaded_books_visually():
     assert ".shelf-card.done" in css and ".shelf-badge.done" in css, (
         "a downloaded book must be distinguishable at a glance")
     assert ".shelf-card.partial" in css, "an unfinished export needs its own state"
+
+
+def test_the_queue_survives_a_restart():
+    """Closing the app used to throw the queue away; it has to come back."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="weread-queue-") as temp:
+        original = app.QUEUE_FILE
+        app.QUEUE_FILE = Path(temp) / "queue.json"
+        try:
+            first = app.WebApi()
+            first.queue = [
+                {"bookId": "111", "title": "书甲", "author": "甲"},
+                {"bookId": "222", "title": "书乙", "author": "乙"},
+            ]
+            first.queue_paused = True
+            first._save_queue()
+
+            second = app.WebApi()
+            assert [b["bookId"] for b in second.queue] == ["111", "222"], second.queue
+            assert second.queue_paused is True, "a restored queue must stay paused"
+            assert second.queue_running is False
+            assert second._restored == 2
+        finally:
+            app.QUEUE_FILE = original
+
+
+def test_the_interrupted_book_goes_back_to_the_head():
+    """A book cut off by closing the window has to be first in line again."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="weread-queue-") as temp:
+        original = app.QUEUE_FILE
+        app.QUEUE_FILE = Path(temp) / "queue.json"
+        try:
+            instance = app.WebApi()
+            instance.queue = [{"bookId": "222", "title": "书乙"}]
+            instance._queue_book = {"bookId": "111", "title": "书甲"}
+            instance._save_queue()
+
+            restored = app.WebApi()
+            assert [b["bookId"] for b in restored.queue] == ["111", "222"], restored.queue
+            assert restored._queue_book is None, "nothing may auto-start on restore"
+        finally:
+            app.QUEUE_FILE = original
+
+
+def test_a_broken_queue_file_does_not_block_startup():
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="weread-queue-") as temp:
+        original = app.QUEUE_FILE
+        path = Path(temp) / "queue.json"
+        app.QUEUE_FILE = path
+        try:
+            path.write_text("{not json", encoding="utf-8")
+            instance = app.WebApi()
+            assert instance.queue == []
+            assert instance._restored == 0
+            # A save has to recover the file rather than keep failing.
+            instance.queue = [{"bookId": "333", "title": "书丙"}]
+            instance._save_queue()
+            assert not path.with_name(path.name + ".tmp").exists()
+            assert "333" in path.read_text(encoding="utf-8")
+        finally:
+            app.QUEUE_FILE = original
+
+
+def test_boot_reports_the_restored_queue():
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="weread-queue-") as temp:
+        original = app.QUEUE_FILE
+        app.QUEUE_FILE = Path(temp) / "queue.json"
+        try:
+            seed = app.WebApi()
+            seed.queue = [{"bookId": "444", "title": "书丁"}]
+            seed._save_queue()
+            payload = app.WebApi().boot()
+        finally:
+            app.QUEUE_FILE = original
+    assert payload["queue"] and payload["queue"][0]["bookId"] == "444"
+    assert payload["queue_paused"] is True
+    assert payload["queue_restored"] == 1
 
 
 def main() -> int:

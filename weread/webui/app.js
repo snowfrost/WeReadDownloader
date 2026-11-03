@@ -15,7 +15,11 @@ const State = {
   shelf: [],
   shelfChecked: new Set(),
   exports: [],
+  storageRows: [],
   exportChecked: new Set(),
+  sources: { output: "", extra: [] },
+  exportTarget: "",
+  exportRunning: false,
   queue: { queue: [], running: false, paused: false, current: null },
   busy: false,
   auth: false,
@@ -419,6 +423,70 @@ function loadExports() {
     renderExports();
     renderStorage(data);
   });
+  loadSources();
+}
+
+/* ---------------- extra source folders ---------------- */
+
+function loadSources() {
+  api("sources").then((data) => {
+    if (!data || data.ok === false) return;
+    State.sources = { output: data.output || "", extra: data.extra || [] };
+    renderSources();
+  });
+}
+
+function renderSources() {
+  const strip = $("#sources-strip");
+  if (!strip) return;
+  strip.innerHTML = "";
+  const label = document.createElement("span");
+  label.className = "sources-label";
+  label.textContent = "扫描目录";
+  strip.append(label);
+  const home = document.createElement("span");
+  home.className = "source-chip home";
+  home.textContent = "默认";
+  home.title = State.sources.output;
+  strip.append(home);
+  (State.sources.extra || []).forEach((path) => {
+    const chip = document.createElement("span");
+    chip.className = "source-chip";
+    chip.textContent = path.split(/[\\/]/).filter(Boolean).pop() || path;
+    chip.title = path;
+    const drop = document.createElement("button");
+    drop.className = "chip-x";
+    drop.textContent = "×";
+    drop.title = "移出扫描列表（不会删除文件）";
+    drop.addEventListener("click", () => {
+      api("remove_source", path).then((result) => {
+        if (result && result.ok === false) toast(result.error, "error");
+        else { loadSources(); State.exportsLoaded = false; loadExports(); }
+      });
+    });
+    chip.append(drop);
+    strip.append(chip);
+  });
+  const add = document.createElement("button");
+  add.className = "btn tiny";
+  add.id = "sources-add";
+  add.textContent = "附加目录…";
+  add.title = "把旧版或其他位置的导出文件夹加进来，同样能被识别和导出";
+  add.addEventListener("click", () => {
+    api("add_source").then((result) => {
+      if (!result || result.ok === false) {
+        if (result && result.error && result.error !== "没有选择文件夹") {
+          toast(result.error, "error");
+        }
+        return;
+      }
+      toast("已加入扫描目录。", "ok");
+      loadSources();
+      State.exportsLoaded = false;
+      loadExports();
+    });
+  });
+  strip.append(add);
 }
 
 function renderExports() {
@@ -434,20 +502,28 @@ function renderExports() {
 }
 
 function exportRow(row, scope) {
+  const key = row.key || row.name;
   const node = document.createElement("div");
-  node.className = "export-row";
+  node.className = "export-row" + (row.external ? " external" : "");
   const check = document.createElement("button");
-  check.className = "check" + (State.exportChecked.has(row.name) ? " on" : "");
+  check.className = "check" + (State.exportChecked.has(key) ? " on" : "");
   check.textContent = "✓";
   check.addEventListener("click", () => {
-    if (State.exportChecked.has(row.name)) State.exportChecked.delete(row.name);
-    else State.exportChecked.add(row.name);
-    check.classList.toggle("on", State.exportChecked.has(row.name));
+    if (State.exportChecked.has(key)) State.exportChecked.delete(key);
+    else State.exportChecked.add(key);
+    check.classList.toggle("on", State.exportChecked.has(key));
     refreshExportDelete();
   });
   const name = document.createElement("div");
   name.className = "export-name";
   name.textContent = row.name;
+  if (row.external) {
+    const tag = document.createElement("span");
+    tag.className = "source-tag";
+    tag.textContent = "外部";
+    tag.title = row.root || "";
+    name.append(tag);
+  }
   const kind = document.createElement("span");
   kind.className = "kind " + row.kind;
   kind.textContent = { done: "成品", failed: "未完成", partial: "半成品", stale: "残留" }[row.kind] || row.kind;
@@ -457,30 +533,126 @@ function exportRow(row, scope) {
   const open = document.createElement("button");
   open.className = "btn tiny";
   open.textContent = "打开";
-  open.addEventListener("click", () => api("open_path", "output"));
-  const del = document.createElement("button");
-  del.className = "btn tiny";
-  del.textContent = "删除";
-  del.addEventListener("click", () => {
-    if (!confirm(`删除「${row.name}」？文件会被永久移除。`)) return;
-    api("delete_exports", [row.name]).then((result) => {
-      if (result && result.ok) {
-        toast(`已删除 ${result.removed.length} 项，回收约 ${result.reclaim_mb} MB。`, "ok");
-        State.exportChecked.delete(row.name);
-        State.exportsLoaded = false;
-        loadExports();
-      } else toast(result.error || "删除失败", "error");
+  open.addEventListener("click", () => api("open_export", key));
+  const parts = [check, name, kind, size, open];
+  if (!row.external) {
+    const del = document.createElement("button");
+    del.className = "btn tiny";
+    del.textContent = "删除";
+    del.addEventListener("click", () => {
+      if (!confirm(`删除「${row.name}」？文件会被永久移除。`)) return;
+      api("delete_exports", [row.name]).then((result) => {
+        if (result && result.ok) {
+          toast(`已删除 ${result.removed.length} 项，回收约 ${result.reclaim_mb} MB。`, "ok");
+          State.exportChecked.delete(key);
+          State.exportsLoaded = false;
+          loadExports();
+        } else toast(result.error || "删除失败", "error");
+      });
     });
-  });
-  node.append(check, name, kind, size, open, del);
+    parts.push(del);
+  }
+  node.append(...parts);
   return node;
 }
 
+function findExportRow(key) {
+  const all = (State.exports || []).concat(State.storageRows || []);
+  return all.find((item) => (item.key || item.name) === key) || null;
+}
+
 function refreshExportDelete() {
-  const count = State.exportChecked.size;
-  const btn = $("#exports-delete");
-  btn.textContent = `删除选中 ${count} 项`;
-  btn.disabled = count === 0;
+  const keys = [...State.exportChecked];
+  const internal = keys.filter((key) => {
+    const row = findExportRow(key);
+    return row && !row.external;
+  });
+  const del = $("#exports-delete");
+  del.textContent = `删除选中 ${internal.length} 项`;
+  del.disabled = internal.length === 0;
+  const exp = $("#exports-export");
+  if (exp) {
+    exp.textContent = `导出 EPUB ${keys.length} 本`;
+    exp.disabled = keys.length === 0 || State.exportRunning;
+  }
+}
+
+/* ---------------- export to a folder ---------------- */
+
+function checkedExportKeys() {
+  return [...State.exportChecked];
+}
+
+function openExportModal() {
+  const keys = checkedExportKeys();
+  if (!keys.length) {
+    toast("先在列表里勾选要导出的书。", "error");
+    return;
+  }
+  if (!State.exportTarget) {
+    const fallback = (State.boot && State.boot.paths && State.boot.paths.export_default) || "";
+    if (fallback) State.exportTarget = fallback;
+  }
+  $("#export-target").value = State.exportTarget || "";
+  $("#export-progress").classList.add("hidden");
+  $("#export-modal").classList.remove("hidden");
+  updateExportPreview();
+}
+
+function updateExportPreview() {
+  const keys = checkedExportKeys();
+  const pattern = $("#export-pattern").value;
+  if (!keys.length) {
+    $("#export-preview").textContent = "示例：—";
+    return;
+  }
+  api("preview_export", keys, pattern).then((result) => {
+    if (!result || result.ok === false || !result.names || !result.names.length) {
+      $("#export-preview").textContent = "示例：—";
+      return;
+    }
+    $("#export-preview").textContent = "示例：" + result.names.join("  ·  ") +
+      "（按已缓存的书名/作者生成，导出时会补取出版社）";
+  });
+}
+
+function pickExportTarget() {
+  api("pick_folder").then((result) => {
+    if (result && result.path) {
+      State.exportTarget = result.path;
+      $("#export-target").value = result.path;
+    } else if (result && result.error && result.error !== "没有选择文件夹") {
+      toast(result.error, "error");
+    }
+  });
+}
+
+function startExport() {
+  const keys = checkedExportKeys();
+  if (!keys.length) {
+    toast("没有勾选任何书。", "error");
+    return;
+  }
+  if (!State.exportTarget) {
+    toast("先选择目标文件夹。", "error");
+    return;
+  }
+  const pattern = $("#export-pattern").value.trim() || "{title}-{author}-{publisher}";
+  const conflict = $("#export-conflict").value;
+  State.exportRunning = true;
+  refreshExportDelete();
+  $("#export-start").disabled = true;
+  $("#export-progress").classList.remove("hidden");
+  $("#export-bar").style.width = "0%";
+  $("#export-progress-text").textContent = "正在导出…";
+  api("export_epubs", keys, State.exportTarget, pattern, conflict).then((result) => {
+    if (!result || result.ok === false) {
+      State.exportRunning = false;
+      $("#export-start").disabled = false;
+      refreshExportDelete();
+      toast((result && result.error) || "导出失败", "error");
+    }
+  });
 }
 
 /* ---------------- history / storage ---------------- */
@@ -525,6 +697,7 @@ function loadStorage() {
 }
 
 function renderStorage(data) {
+  State.storageRows = (data && data.rows) || [];
   const row = $("#stat-row");
   row.innerHTML = "";
   const stats = [
@@ -705,6 +878,36 @@ window.WR = {
       case "log":
         appendLog(data.line);
         break;
+      case "sources_changed":
+        State.sources = { output: data.output || "", extra: data.extra || [] };
+        renderSources();
+        break;
+      case "export_start":
+        State.exportRunning = true;
+        $("#export-progress").classList.remove("hidden");
+        $("#export-bar").style.width = "0%";
+        $("#export-progress-text").textContent = `准备导出 ${data.total} 本…`;
+        break;
+      case "export_progress": {
+        const total = data.total || 1;
+        const percent = Math.round((data.done / total) * 100);
+        $("#export-bar").style.width = percent + "%";
+        const mark = data.state === "skip" ? "跳过" : data.state === "error" ? "失败" : "已导出";
+        $("#export-progress-text").textContent =
+          `${data.done}/${total} · ${mark} ${data.name}` + (data.detail ? `（${data.detail}）` : "");
+        break;
+      }
+      case "export_done":
+        State.exportRunning = false;
+        $("#export-start").disabled = false;
+        refreshExportDelete();
+        $("#export-bar").style.width = "100%";
+        $("#export-progress-text").textContent =
+          `完成：${data.exported} 本已复制，${data.skipped} 本跳过，${data.failed} 本失败 → ${data.target}`;
+        toast(`导出完成：${data.exported} 本。`, data.failed ? "error" : "ok");
+        State.exportsLoaded = false;
+        loadExports();
+        break;
       case "storage_changed":
         State.exports = data.rows || [];
         State.exportsLoaded = true;
@@ -855,13 +1058,20 @@ function bindUi() {
     });
   });
   $("#exports-select-all").addEventListener("click", () => {
-    const all = State.exports.every((r) => State.exportChecked.has(r.name));
+    const all = State.exports.every((r) => State.exportChecked.has(r.key || r.name));
     State.exportChecked.clear();
-    if (!all) State.exports.forEach((r) => State.exportChecked.add(r.name));
+    if (!all) State.exports.forEach((r) => State.exportChecked.add(r.key || r.name));
     renderExports();
   });
+  $("#exports-export").addEventListener("click", openExportModal);
+  $("#export-pick").addEventListener("click", pickExportTarget);
+  $("#export-pattern").addEventListener("input", updateExportPreview);
+  $("#export-start").addEventListener("click", startExport);
   $("#exports-delete").addEventListener("click", () => {
-    const names = [...State.exportChecked];
+    const names = [...State.exportChecked].map((key) => {
+      const row = findExportRow(key);
+      return row && !row.external ? row.name : "";
+    }).filter(Boolean);
     if (!names.length) return;
     if (!confirm(`删除选中的 ${names.length} 项？文件会被永久移除。`)) return;
     api("delete_exports", names).then((result) => {
@@ -949,11 +1159,16 @@ async function boot() {
     "纯正文": "不要划线、注释和想法，最快",
   }[State.annotation] || "";
   updateAuth(!!(info.auth && info.auth.ready));
-  applyQueue({ queue: info.queue || [], running: !!info.queue_running });
+  applyQueue({ queue: info.queue || [], running: !!info.queue_running,
+               paused: !!info.queue_paused });
   $("#status-meta").textContent = "v" + (info.version || "");
   fillSettings();
   if (!info.auth || !info.auth.ready) {
     setStatus("尚未登录。点右上角「登录 / 切换账号」扫码登录。", "error");
+  } else if (info.queue_restored) {
+    /* The queue outlives the window now; say so, and say it is paused. */
+    setStatus(`已恢复上次队列 ${info.queue_restored} 本（已暂停），点「队列」里的继续下载接着跑。`,
+      "info");
   } else {
     setStatus("准备就绪。", "ok");
   }

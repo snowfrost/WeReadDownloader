@@ -19,7 +19,7 @@ if not os.path.isfile(ICON):
 datas = [(WEBUI, os.path.join("weread", "webui"))]
 binaries = []
 hiddenimports = [
-    "weread_login", "weread_core", "version",
+    "weread_login", "weread_core", "library", "version",
     "webview.platforms.edgechromium",
     "webview.platforms.winforms",
     "clr_loader", "pythonnet",

@@ -16,6 +16,7 @@ widget-tree relayout.
 from __future__ import annotations
 
 import base64
+import ctypes
 import io
 import json
 import os
@@ -27,12 +28,14 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 
 import requests
 import webview
 
 import weread_core as core
+import library
 import weread_login as login
 from weread_core import (
     LOG_DIR,
@@ -163,6 +166,41 @@ class ServiceClient:
                 pass
 
 
+QUEUE_FILE = core.PRIVATE / "queue.json"
+
+
+def _load_queue_file():
+    """The queue saved by the last session, or None when unusable."""
+    try:
+        raw = QUEUE_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    items = [item for item in (data.get("items") or [])
+             if isinstance(item, dict) and item.get("bookId")]
+    results = [item for item in (data.get("results") or []) if isinstance(item, dict)]
+    return {"items": items, "results": results[-50:],
+            "paused": bool(data.get("paused")),
+            "saved_at": data.get("saved_at")}
+
+
+def _write_queue_file(payload) -> None:
+    """Write atomically: a crash mid-write must not leave a broken queue."""
+    try:
+        QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = QUEUE_FILE.with_name(QUEUE_FILE.name + ".tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+        os.replace(temp, QUEUE_FILE)
+    except OSError:
+        pass
+
+
 class _JsApiFacade:
     """The object handed to pywebview as js_api.
 
@@ -216,6 +254,8 @@ class WebApi:
         self._pause_requested = False
         self._queue_retried = set()
         self._queue_book = None
+        self._restored = 0
+        self._restore_queue()
         self.annotation = DEFAULT_ANNOTATION
         self._closing = False
         self._login_session = None
@@ -241,6 +281,54 @@ class WebApi:
 
     def _emit(self, name, data=None):
         self.events.put((name, data))
+
+    def _restore_queue(self):
+        """Bring back last session's queue and its paused flag.
+
+        Nothing starts on its own: a queue that was mid-run when the app closed
+        comes back paused, so the user decides when to continue.
+        """
+        saved = _load_queue_file()
+        if not saved or not saved["items"]:
+            return
+        seen = set()
+        items = []
+        for item in saved["items"]:
+            book_id = str(item.get("bookId"))
+            if book_id in seen:
+                continue
+            seen.add(book_id)
+            items.append(dict(item))
+        self.queue = items
+        self.queue_results = saved["results"]
+        self.queue_running = False
+        self.queue_paused = True
+        self._queue_book = None
+        self._restored = len(items)
+
+    def _save_queue(self):
+        """Persist the queue, the in-flight book and the paused flag.
+
+        Closing the app used to throw the queue away; the interrupted download
+        is saved at the head so "continue" picks up where it stopped.
+        """
+        items = []
+        seen = set()
+        for item in ([self._queue_book] if self._queue_book else []) + list(self.queue):
+            if not isinstance(item, dict):
+                continue
+            book_id = str(item.get("bookId") or "")
+            if not book_id or book_id in seen:
+                continue
+            seen.add(book_id)
+            items.append(dict(item))
+        _write_queue_file({
+            "version": 1,
+            "items": items,
+            "results": self.queue_results[-50:],
+            "paused": bool(self.queue_paused),
+            "saved_at": int(time.time()),
+        })
 
     def poll_events(self, limit=80):
         """Drain queued events for the page. Called by JS about every 120ms."""
@@ -295,10 +383,13 @@ class WebApi:
             "ok": True,
             "version": APP_VERSION,
             "title": APP_TITLE,
-            "paths": {"output": str(OUTPUT), "logs": str(LOG_DIR)},
+            "paths": {"output": str(OUTPUT), "logs": str(LOG_DIR),
+                      "export_default": str(Path.home() / "Documents" / "WeRead 导出")},
             "auth": status,
             "queue": self.queue,
             "queue_running": self.queue_running,
+            "queue_paused": self.queue_paused,
+            "queue_restored": self._restored,
             "annotation": self.annotation,
             "annotations": list(ANNOTATION_LABELS),
             "selected": self.selected,
@@ -376,6 +467,9 @@ class WebApi:
                 info = parse_book_info_message(line)
                 if info is not None:
                     holder.update(info)
+                    library.remember_meta(book_id, **{
+                        key: info.get(key) for key in ("title", "author",
+                                                       "publisher", "category")})
                 elif line.startswith("FAILED "):
                     self._status(friendly_error(line), "error")
                 self._log(line)
@@ -483,6 +577,11 @@ class WebApi:
             for row in rows:
                 if isinstance(row, dict):
                     row["download"] = local.get(str(row.get("bookId") or ""), "")
+                    # Remember what the shelf already knows, so a rename never
+                    # has to ask the network for a title that is right here.
+                    library.remember_meta(row.get("bookId"),
+                                          title=row.get("title"),
+                                          author=row.get("author"))
             self._emit("shelf", {"rows": rows, "code": code})
             self._set_busy(False)
             self._status("已读取微信书架，共 %d 本。" % len(rows)
@@ -587,6 +686,7 @@ class WebApi:
         if not self.queue_running:
             self._status("下载完成。" if code == 0 else "下载未完成，详见技术日志。",
                          "ok" if code == 0 else "error")
+            self._save_queue()
             return
         if self._pause_requested:
             self.queue_running = False
@@ -596,6 +696,7 @@ class WebApi:
                 self.queue.insert(0, dict(book))
             self._emit("queue", self._queue_state())
             self._status("队列已暂停，当前这本保留在队首。", "info")
+            self._save_queue()
             return
         success = code == 0
         self.queue_results.append({
@@ -607,6 +708,7 @@ class WebApi:
             self._status("队列继续：开始下载《%s》。" % (nxt.get("title") or
                                                       nxt.get("bookId")), "busy")
             self._start_one(nxt)
+            self._save_queue()
             return
         self.queue_running = False
         failed = [r for r in self.queue_results if not r["ok"]]
@@ -614,6 +716,7 @@ class WebApi:
         self._status("队列结束：%d 本完成，%d 本未完成。"
                      % (len(self.queue_results) - len(failed), len(failed)),
                      "ok" if not failed else "error")
+        self._save_queue()
 
     def enqueue(self, books):
         if not isinstance(books, list):
@@ -629,11 +732,13 @@ class WebApi:
             existing.add(bid)
             added += 1
         self._emit("queue", self._queue_state())
+        self._save_queue()
         return {"ok": True, "added": added, "queue": self._queue_state()}
 
     def remove_queue(self, book_id):
         self.queue = [b for b in self.queue if str(b.get("bookId")) != str(book_id)]
         self._emit("queue", self._queue_state())
+        self._save_queue()
         return {"ok": True}
 
     def clear_queue(self):
@@ -641,6 +746,7 @@ class WebApi:
             return {"ok": False, "error": "下载中不能清空队列"}
         self.queue.clear()
         self._emit("queue", self._queue_state())
+        self._save_queue()
         return {"ok": True}
 
     def start_queue(self):
@@ -655,6 +761,7 @@ class WebApi:
         self.queue_results.clear()
         self._emit("queue", self._queue_state())
         self._start_one(self.queue.pop(0))
+        self._save_queue()
         return {"ok": True}
 
     def pause(self):
@@ -680,9 +787,11 @@ class WebApi:
         self.queue_running = True
         if not self.queue:
             self.queue_running = False
+            self._save_queue()
             return {"ok": False, "error": "队列里没有书"}
         self._emit("queue", self._queue_state())
         self._start_one(self.queue.pop(0))
+        self._save_queue()
         return {"ok": True}
 
     def _queue_state(self):
@@ -746,61 +855,71 @@ class WebApi:
         """bookId -> "done" / "partial" for everything already on this machine.
 
         Export folders are named `<title>-<bookId>`; an interrupted run keeps a
-        `.work` suffix. The shelf uses this to tint books that are already here,
-        so "did I download this one?" does not need a folder hunt.
+        `.work` suffix. Every folder the user pointed at counts -- books saved
+        by an older build live in its own output folder, and they should show up
+        as "already downloaded" too.
         """
         index = {}
-        try:
-            OUTPUT.mkdir(parents=True, exist_ok=True)
-            for entry in OUTPUT.iterdir():
+        for root in library.scan_roots():
+            try:
+                entries = list(root.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
                 if not entry.is_dir():
                     continue
-                name = entry.name
-                partial = name.endswith(".work")
-                stem = name[:-5] if partial else name
-                match = re.search(r"-(\d{4,})$", stem)
-                if match is None:
+                book_id = library.book_id_from_name(entry.name)
+                if not book_id:
                     continue
-                book_id = match.group(1)
-                if partial:
+                state = library.folder_state(entry)
+                if state == "failed":
                     state = "partial"
-                elif name.startswith("_stale-"):
-                    state = "partial"
-                else:
-                    state = "done" if next(entry.glob("*.epub"), None) else "partial"
                 # A finished export wins over a leftover half-download.
                 if index.get(book_id) != "done":
                     index[book_id] = state
-        except OSError:
-            pass
         return index
+
+    def _folder_size_mb(self, folder: Path) -> float:
+        total = 0
+        for root_dir, _dirs, files in os.walk(folder):
+            for filename in files:
+                try:
+                    total += os.stat(os.path.join(root_dir, filename)).st_size
+                except OSError:
+                    continue
+        return round(total / 1048576.0, 1)
 
     def _scan_exports(self):
         rows = []
-        try:
-            OUTPUT.mkdir(parents=True, exist_ok=True)
-            for entry in sorted(OUTPUT.iterdir(),
-                                key=lambda p: p.stat().st_mtime, reverse=True):
+        for root in library.scan_roots():
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                entries = sorted(root.iterdir(),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+            except OSError:
+                continue
+            try:
+                external = root.resolve() != OUTPUT.resolve()
+            except OSError:
+                external = True
+            for entry in entries:
                 if not entry.is_dir():
                     continue
-                total = 0
-                for root_dir, _dirs, files in os.walk(entry):
-                    for filename in files:
-                        try:
-                            total += os.stat(os.path.join(root_dir, filename)).st_size
-                        except OSError:
-                            continue
-                mtime = int(entry.stat().st_mtime)
-                if entry.name.endswith(".work"):
-                    kind = "partial"
-                elif entry.name.startswith("_stale-"):
+                kind = library.folder_state(entry)
+                if entry.name.startswith("_stale-"):
                     kind = "stale"
-                else:
-                    kind = "done" if next(entry.glob("*.epub"), None) else "failed"
-                rows.append({"name": entry.name, "mb": round(total / 1048576.0, 1),
-                             "mtime": mtime, "kind": kind})
-        except OSError:
-            pass
+                epub = library.find_epub(entry)
+                rows.append({
+                    "name": entry.name,
+                    "key": str(entry),
+                    "root": str(root),
+                    "external": external,
+                    "bookId": library.book_id_from_name(entry.name),
+                    "epub": str(epub) if epub else "",
+                    "mb": self._folder_size_mb(entry),
+                    "mtime": int(entry.stat().st_mtime),
+                    "kind": kind,
+                })
         return rows
 
     def local_state(self):
@@ -811,7 +930,10 @@ class WebApi:
     def storage(self):
         rows = self._scan_exports()
         done = [r for r in rows if r["kind"] == "done"]
-        reclaimable = [r for r in rows if r["kind"] in ("partial", "stale", "failed")]
+        # Only the app's own folder may be cleaned up; extra folders belong to
+        # the user and are read-only here.
+        reclaimable = [r for r in rows
+                       if not r["external"] and r["kind"] in ("partial", "stale", "failed")]
         return {
             "rows": rows,
             "total_mb": round(sum(r["mb"] for r in rows), 1),
@@ -850,8 +972,227 @@ class WebApi:
     def cleanup_exports(self):
         rows = self._scan_exports()
         victims = [r["name"] for r in rows
-                   if r["kind"] in ("partial", "stale", "failed")]
+                   if not r["external"] and r["kind"] in ("partial", "stale", "failed")]
         return self.delete_exports(victims)
+
+    # -- extra source folders / EPUB export ----------------------------
+    def sources(self):
+        extra = library.load_sources()
+        return {"ok": True, "output": str(OUTPUT),
+                "extra": [str(path) for path in extra],
+                "roots": [str(path) for path in library.scan_roots()]}
+
+    def _pick_folder(self) -> str:
+        """Ask Windows for a folder; empty string when the user cancels."""
+        try:
+            import webview as _webview
+            if self.window is None:
+                return ""
+            picked = self.window.create_file_dialog(_webview.FOLDER_DIALOG,
+                                                    allow_multiple=False)
+        except Exception:
+            return ""
+        if not picked:
+            return ""
+        if isinstance(picked, (list, tuple)):
+            return str(picked[0]) if picked else ""
+        return str(picked)
+
+    def pick_folder(self):
+        path = self._pick_folder()
+        return {"ok": bool(path), "path": path,
+                "error": "" if path else "没有选择文件夹"}
+
+    def add_source(self, path=None):
+        target = path or self._pick_folder()
+        if not target:
+            return {"ok": False, "error": "没有选择文件夹"}
+        ok, error = library.add_source(target)
+        if not ok:
+            return {"ok": False, "error": error}
+        sources = self.sources()
+        self._emit("sources_changed", sources)
+        self._emit("storage_changed", self.storage())
+        return dict(sources, added=str(target))
+
+    def remove_source(self, path):
+        ok, error = library.remove_source(path)
+        if not ok:
+            return {"ok": False, "error": error}
+        sources = self.sources()
+        self._emit("sources_changed", sources)
+        self._emit("storage_changed", self.storage())
+        return sources
+
+    def open_export(self, key):
+        """Open one export folder in Explorer (direct children of a root only)."""
+        try:
+            folder = Path(str(key or "")).resolve()
+        except (TypeError, ValueError, OSError):
+            return {"ok": False, "error": "路径无效"}
+        allowed = False
+        for root in library.scan_roots():
+            try:
+                if folder.parent == root.resolve() and folder.is_dir():
+                    allowed = True
+                    break
+            except OSError:
+                continue
+        if not allowed:
+            return {"ok": False, "error": "只能打开扫描目录下的文件夹"}
+        try:
+            os.startfile(str(folder))
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def preview_export(self, keys, pattern=None):
+        """Show what the first few names will look like, using cached metadata.
+
+        No network here on purpose: a preview must answer instantly. The real
+        export fills in a missing publisher; the UI says so.
+        """
+        rows = {row["key"]: row for row in self._scan_exports()}
+        chosen = [rows[str(key)] for key in (keys or []) if str(key) in rows]
+        template = (pattern or "").strip() or library.DEFAULT_PATTERN
+        names = []
+        for row in chosen[:3]:
+            epub = Path(row["epub"]) if row.get("epub") else Path(row["key"])
+            values = self._rename_values(row, epub)
+            names.append(library.render_pattern(template, values) + ".epub")
+        return {"ok": True, "names": names, "total": len(chosen)}
+
+    def _rename_values(self, row, epub: Path) -> dict:
+        """What the rename pattern can use for one book."""
+        book_id = row.get("bookId") or library.book_id_from_name(row["name"])
+        meta = library.meta_for(book_id)
+        fallback = row["name"][:-5] if row["name"].endswith(".work") else row["name"]
+        if book_id and fallback.endswith("-" + book_id):
+            fallback = fallback[: -(len(book_id) + 1)]
+        values = {
+            "bookId": book_id,
+            "title": meta.get("title") or fallback,
+            "author": meta.get("author") or "",
+            "publisher": meta.get("publisher") or "",
+            "category": meta.get("category") or "",
+            "date": time.strftime("%Y-%m-%d", time.localtime(row.get("mtime") or 0)),
+        }
+        values["epub"] = str(epub)
+        return values
+
+    def _fill_missing_meta(self, values: dict) -> dict:
+        """Fetch title/author/publisher through the worker when the cache lacks them.
+
+        Only done when the pattern actually asks for a field we do not have, so
+        a simple `{title}` rename never waits on the network.
+        """
+        if values.get("publisher") and values.get("category"):
+            return values
+        book_id = values.get("bookId")
+        if not book_id:
+            return values
+        holder = {}
+
+        def on_line(line):
+            info = parse_book_info_message(line)
+            if info is not None:
+                holder.update(info)
+
+        try:
+            self._job += 1
+            self.service.request(self._job, "book-info", {"bookId": book_id}, on_line)
+        except Exception:
+            return values
+        if not holder:
+            return values
+        library.remember_meta(book_id, **{key: holder.get(key)
+                                         for key in ("title", "author",
+                                                     "publisher", "category")})
+        for key in ("title", "author", "publisher", "category"):
+            if not values.get(key) and holder.get(key):
+                values[key] = holder[key]
+        return values
+
+    def export_epubs(self, keys, target, pattern=None, on_conflict="skip"):
+        """Copy the chosen finished EPUBs into one folder under new names."""
+        if not isinstance(keys, (list, tuple)) or not keys:
+            return {"ok": False, "error": "先在列表里勾选要导出的书"}
+        chosen = []
+        rows = {row["key"]: row for row in self._scan_exports()}
+        for key in keys:
+            row = rows.get(str(key))
+            if row is not None:
+                chosen.append(row)
+        if not chosen:
+            return {"ok": False, "error": "选中的条目已经不在磁盘上，刷新一下列表"}
+        try:
+            destination = Path(str(target or "")).expanduser()
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "目标文件夹无效"}
+        if not str(destination).strip():
+            return {"ok": False, "error": "请选择目标文件夹"}
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"ok": False, "error": "无法创建目标文件夹：%s" % exc}
+        if not os.access(str(destination), os.W_OK):
+            return {"ok": False, "error": "目标文件夹不可写"}
+
+        pattern = (pattern or "").strip() or library.DEFAULT_PATTERN
+        conflict = on_conflict if on_conflict in ("skip", "overwrite", "suffix") else "skip"
+        threading.Thread(target=self._run_export,
+                         args=(chosen, destination, pattern, conflict),
+                         daemon=True).start()
+        return {"ok": True, "queued": len(chosen)}
+
+    def _run_export(self, rows, destination: Path, pattern: str,
+                    on_conflict: str) -> None:
+        total = len(rows)
+        exported = skipped = failed = 0
+        self._emit("export_start", {"total": total, "target": str(destination)})
+        entries = []
+        for row in rows:
+            epub = Path(row["epub"]) if row.get("epub") else library.find_epub(Path(row["key"]))
+            if epub is None or not epub.is_file():
+                skipped += 1
+                self._emit("export_progress", {
+                    "done": exported + skipped + failed, "total": total,
+                    "name": row["name"], "state": "skip",
+                    "detail": "没有成品 EPUB"})
+                continue
+            values = self._rename_values(row, epub)
+            if "{publisher}" in pattern or "{category}" in pattern:
+                values = self._fill_missing_meta(values)
+            entries.append({"key": row["key"], "epub": str(epub),
+                            "values": values})
+        taken = {item.name for item in destination.glob("*.epub")}
+        plans = library.plan_names(entries, pattern, taken, on_conflict)
+        for plan in plans:
+            label = plan["values"].get("title") or Path(plan["epub"]).stem
+            if plan["action"] == "skip":
+                skipped += 1
+                self._emit("export_progress", {
+                    "done": exported + skipped + failed, "total": total,
+                    "name": label, "state": "skip", "detail": "同名文件已存在"})
+                continue
+            try:
+                shutil.copy2(plan["epub"], destination / plan["target"])
+            except Exception as exc:
+                failed += 1
+                self._emit("export_progress", {
+                    "done": exported + skipped + failed, "total": total,
+                    "name": label, "state": "error", "detail": str(exc)})
+                continue
+            exported += 1
+            self._emit("export_progress", {
+                "done": exported + skipped + failed, "total": total,
+                "name": plan["target"], "state": "ok", "detail": ""})
+        self._emit("export_done", {
+            "total": total, "exported": exported, "skipped": skipped,
+            "failed": failed, "target": str(destination)})
+        self._status("导出完成：%d 本已复制，%d 本跳过，%d 本失败。"
+                     % (exported, skipped, failed),
+                     "ok" if not failed else "error")
 
     # -- QR login ------------------------------------------------------
     def login_begin(self):
@@ -968,6 +1309,7 @@ class WebApi:
 
     def shutdown(self):
         self._closing = True
+        self._save_queue()
         self._login_cancel.set()
         self._otp_ready.set()
         try:
@@ -1011,6 +1353,25 @@ def _boot_log(message: str) -> None:
         pass
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when a process with this pid still exists.
+
+    Used to avoid deleting the profile of a second instance that is genuinely
+    running; when the answer is unknown we assume alive and keep the folder.
+    """
+    if pid <= 0:
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    except Exception:
+        return True
+
+
 def _webview_profile() -> Path:
     """A fresh WebView2 profile per run.
 
@@ -1021,19 +1382,23 @@ def _webview_profile() -> Path:
     nothing. Login cookies are kept by weread_login (cookies.json), not by the
     browser profile, so a new folder per run costs only a few hundred ms.
 
-    Old folders are pruned by age so they cannot accumulate.
+    The name carries a random suffix on purpose: `run-<pid>` collides whenever
+    Windows hands out a reused pid, and the collision lands exactly on a folder
+    the orphaned helpers still hold. Folders left behind by dead runs are
+    removed here; a folder owned by a live process is left alone.
     """
     base = core.PRIVATE / "webview"
     try:
         base.mkdir(parents=True, exist_ok=True)
-        cutoff = time.time() - 24 * 3600
         for old in base.iterdir():
-            try:
-                if old.is_dir() and old.stat().st_mtime < cutoff:
-                    shutil.rmtree(old, ignore_errors=True)
-            except OSError:
+            if not old.is_dir() or not old.name.startswith("run-"):
                 continue
-        profile = base / ("run-%d" % os.getpid())
+            parts = old.name.split("-")
+            owner = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if owner and owner != os.getpid() and _pid_alive(owner):
+                continue
+            shutil.rmtree(old, ignore_errors=True)
+        profile = base / ("run-%d-%s" % (os.getpid(), uuid.uuid4().hex[:6]))
         profile.mkdir(parents=True, exist_ok=True)
         return profile
     except OSError:

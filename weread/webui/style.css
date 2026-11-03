@@ -467,3 +467,52 @@ button:focus-visible { outline: 2px solid var(--gold-line); outline-offset: 2px;
 .download-head { flex-wrap: wrap; }
 .annotation { min-width: 0; flex: 1; justify-content: flex-end; }
 .annotation .hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw; }
+
+/* ---------- export shelf: extra folders and the export dialog ---------- */
+.sources-strip {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 2px 16px 8px;
+}
+.sources-label { color: var(--faint); font-size: 10px; }
+.source-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 8px; border-radius: 999px; font-size: 10px;
+  border: 1px solid var(--line-strong); background: rgba(255, 255, 255, 0.04);
+  color: var(--muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-chip.home { border-color: var(--gold-line); color: var(--gold); }
+.chip-x {
+  border: 0; background: transparent; color: var(--faint);
+  font-size: 12px; line-height: 1; cursor: pointer; padding: 0 0 0 2px;
+}
+.chip-x:hover { color: var(--red); }
+.export-row.external .export-name { color: var(--muted); }
+.source-tag {
+  margin-left: 6px; padding: 1px 5px; border-radius: 4px; font-size: 9px;
+  border: 1px solid var(--line-strong); color: var(--faint);
+}
+
+.export-modal { width: min(560px, 92vw); }
+.export-form { display: flex; flex-direction: column; gap: 12px; padding: 14px 18px 4px; }
+.export-form .field { display: flex; flex-direction: column; gap: 6px; }
+.export-form .field > span { color: var(--faint); font-size: 11px; }
+.export-form input {
+  border: 1px solid var(--line); border-radius: 8px;
+  background: #131e30; color: var(--ink);
+  padding: 7px 9px; font-size: 12px; outline: none; min-width: 0;
+}
+.export-form input:focus { border-color: var(--gold-line); }
+.export-form .inline-row { display: flex; gap: 8px; align-items: center; }
+.export-form .inline-row input { flex: 1; }
+.export-form .hint { color: var(--faint); font-size: 10px; line-height: 1.6; margin: 0; }
+.export-progress .bar {
+  height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+.export-progress .bar > i {
+  display: block; height: 100%; width: 0;
+  background: linear-gradient(90deg, #d9a94f, #f2d49a);
+  transition: width 0.2s;
+}
+.export-progress .hint { margin-top: 6px; }
