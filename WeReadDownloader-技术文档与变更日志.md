@@ -243,6 +243,20 @@ WeReadWorker.exe (CLI 引擎)
 
 ## 四、变更日志（Keep a Changelog 格式）
 
+### 2026-11-03 (3) 发布 v1.0.9（**Released**）
+
+- 版本号 `1.0.9`（`weread/version.py` 单一事实源，`tools/sync_version.py` 已把 ISS 的
+  `MyAppVersion` 同步为 1.0.9）。
+- 提交 `f56d985` 到 `master`（父提交是上一版发布后的 `86f3210`），tag `v1.0.9`：
+  <https://github.com/snowfrost/WeReadDownloader/releases/tag/v1.0.9>
+- 资产 `WeReadDesktop-1.0.9-webview-win64.zip`，20,115,127 字节；解压实测界面显示
+  `v1.0.9`、状态「准备就绪」。
+- 内容：队列/暂停状态落盘、扫描目录（旧导出目录识别）、一键导出 EPUB 并按规则重命名、
+  强杀后空白窗口的 profile 命名修复。
+- CI（手动 dispatch，API 改 ref 不会自动触发）：`privacy gate` 与 `tests (Windows / Python 3.9)`
+  均 **success**。
+- 发布仍走 Git Data API（本机 `github.com:443` 不可达），脚本 `tools/publish_release.py`。
+
 ### 2026-11-03 (2) 旧目录识别 + 一键导出 EPUB 并按规则重命名（**Added**）
 
 **一、旧文件夹里的书也标「已下载」**
